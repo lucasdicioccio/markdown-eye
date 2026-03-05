@@ -1,0 +1,14 @@
+[package]
+name = "markdown-eye"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "markdown-eye"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+eframe = { version = "0.33" }
+egui_commonmark = { version = "0.22", features = ["better_syntax_highlighting"] }
+notify = "6"
