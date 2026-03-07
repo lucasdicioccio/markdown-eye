@@ -4,7 +4,7 @@ use std::{
     sync::mpsc::{self, Receiver},
 };
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use eframe::egui;
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -12,17 +12,35 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 #[derive(Parser)]
 #[command(name = "markdown-eye", version, about = "A markdown file viewer")]
 struct Cli {
-    /// One or more markdown files to display
-    #[arg(required = true, value_name = "FILES")]
-    files: Vec<PathBuf>,
+    #[command(subcommand)]
+    command: Commands,
+}
 
-    /// Portrait window proportions (~800x1100)
-    #[arg(long, conflicts_with = "landscape")]
-    portrait: bool,
-
-    /// Landscape window proportions (~1200x800, default)
-    #[arg(long, conflicts_with = "portrait")]
-    landscape: bool,
+#[derive(Subcommand)]
+enum Commands {
+    /// Print tool description as JSON (agents-exe binary tool protocol)
+    Describe,
+    /// Display markdown content read from stdin
+    Run {
+        /// Portrait window proportions (~800x1100)
+        #[arg(long, conflicts_with = "landscape")]
+        portrait: bool,
+        /// Landscape window proportions (~1200x800, default)
+        #[arg(long, conflicts_with = "portrait")]
+        landscape: bool,
+    },
+    /// Display one or more markdown files
+    View {
+        /// One or more markdown files to display
+        #[arg(required = true, value_name = "FILES")]
+        files: Vec<PathBuf>,
+        /// Portrait window proportions (~800x1100)
+        #[arg(long, conflicts_with = "landscape")]
+        portrait: bool,
+        /// Landscape window proportions (~1200x800, default)
+        #[arg(long, conflicts_with = "portrait")]
+        landscape: bool,
+    },
 }
 
 struct FileTab {
@@ -156,59 +174,93 @@ impl eframe::App for App {
     }
 }
 
-fn main() {
-    let cli = Cli::parse();
+fn window_dims(portrait: bool) -> (f32, f32) {
+    if portrait { (800.0, 1100.0) } else { (1200.0, 800.0) }
+}
 
-    let mut errors = Vec::new();
-    for path in &cli.files {
-        let is_stdin = path == std::path::Path::new("/dev/stdin");
-        if !is_stdin && !path.exists() {
-            errors.push(format!("File not found: {}", path.display()));
-        } else if !is_stdin && path.extension().and_then(|e| e.to_str()) != Some("md") {
-            errors.push(format!("Not a .md file: {}", path.display()));
-        }
-    }
-    if !errors.is_empty() {
-        for e in errors {
-            eprintln!("error: {e}");
-        }
-        std::process::exit(1);
-    }
-
-    let tabs: Vec<FileTab> = cli
-        .files
-        .into_iter()
-        .filter_map(|p| match FileTab::load(p) {
-            Ok(t) => Some(t),
-            Err(e) => {
-                eprintln!("error: {e}");
-                None
-            }
-        })
-        .collect();
-
-    if tabs.is_empty() {
-        eprintln!("error: no files to display");
-        std::process::exit(1);
-    }
-
-    let (width, height) = if cli.portrait {
-        (800.0, 1100.0)
-    } else {
-        (1200.0, 800.0)
-    };
-
+fn launch(tabs: Vec<FileTab>, portrait: bool) {
+    let (width, height) = window_dims(portrait);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("markdown-eye")
             .with_inner_size([width, height]),
         ..Default::default()
     };
-
     eframe::run_native(
         "markdown-eye",
         options,
         Box::new(|_cc| Ok(Box::new(App::new(tabs, false)))),
     )
     .unwrap();
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Describe => {
+            println!(
+                r#"{{
+  "slug": "markdown-eye",
+  "description": "Opens a GUI window to render and display markdown content",
+  "args": [
+    {{
+      "name": "content",
+      "description": "The markdown content to display",
+      "type": "string",
+      "backing_type": "string",
+      "arity": "single",
+      "mode": "stdin"
+    }}
+  ]
+}}"#
+            );
+        }
+
+        Commands::Run { portrait, .. } => {
+            let content = fs::read_to_string("/dev/stdin").unwrap_or_else(|e| {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            });
+            let tab = FileTab {
+                path: PathBuf::from("/dev/stdin"),
+                content,
+                cache: CommonMarkCache::default(),
+            };
+            launch(vec![tab], portrait);
+        }
+
+        Commands::View { files, portrait, .. } => {
+            let mut errors = Vec::new();
+            for path in &files {
+                if !path.exists() {
+                    errors.push(format!("File not found: {}", path.display()));
+                }
+            }
+            if !errors.is_empty() {
+                for e in errors {
+                    eprintln!("error: {e}");
+                }
+                std::process::exit(1);
+            }
+
+            let tabs: Vec<FileTab> = files
+                .into_iter()
+                .filter_map(|p| match FileTab::load(p) {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        None
+                    }
+                })
+                .collect();
+
+            if tabs.is_empty() {
+                eprintln!("error: no files to display");
+                std::process::exit(1);
+            }
+
+            launch(tabs, portrait);
+        }
+    }
 }
