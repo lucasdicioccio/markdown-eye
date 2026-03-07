@@ -161,9 +161,10 @@ fn main() {
 
     let mut errors = Vec::new();
     for path in &cli.files {
-        if !path.exists() {
+        let is_stdin = path == std::path::Path::new("/dev/stdin");
+        if !is_stdin && !path.exists() {
             errors.push(format!("File not found: {}", path.display()));
-        } else if path.extension().and_then(|e| e.to_str()) != Some("md") {
+        } else if !is_stdin && path.extension().and_then(|e| e.to_str()) != Some("md") {
             errors.push(format!("Not a .md file: {}", path.display()));
         }
     }
@@ -207,7 +208,7 @@ fn main() {
     eframe::run_native(
         "markdown-eye",
         options,
-        Box::new(|_cc| Ok(Box::new(App::new(tabs, true)))),
+        Box::new(|_cc| Ok(Box::new(App::new(tabs, false)))),
     )
     .unwrap();
 }
