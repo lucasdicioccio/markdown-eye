@@ -168,6 +168,15 @@ impl eframe::App for FormApp {
                                     ui.text_edit_singleline(s);
                                 }
                             }
+                            "textarea" => {
+                                if let FieldState::Text(ref mut s) = self.states[i] {
+                                    ui.add(
+                                        egui::TextEdit::multiline(s)
+                                            .desired_rows(4)
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                }
+                            }
                             "password" => {
                                 if let FieldState::Text(ref mut s) = self.states[i] {
                                     ui.add(egui::TextEdit::singleline(s).password(true));
@@ -460,6 +469,10 @@ Supported field types:
                 default: any string.
                 output:  string.
 
+  textarea      Multi-line text input.
+                default: any string (may include newlines).
+                output:  string (newlines preserved).
+
   password      Masked single-line text input.
                 default: any string.
                 output:  string.
@@ -530,7 +543,7 @@ fn main() {
   "args": [
     {{
       "name": "content",
-      "description": "Markdown content to display. Optionally include a ```form block with a JSON object {{\"fields\": [...]}} to define interactive form fields. Supported field types: entry (text input), password (hidden input), question (yes/no checkbox), list (dropdown, requires \"options\" array). NOTE: ignored entirely when --mode echo-instructions is set.",
+      "description": "Markdown content to display. Optionally include a ```form block with a JSON object {{\"fields\": [...]}} to define interactive form fields. Supported field types: entry (text input), textarea (multi-line text input), password (hidden input), question (yes/no checkbox), list (dropdown, requires \"options\" array). NOTE: ignored entirely when --mode echo-instructions is set.",
       "type": "string",
       "backing_type": "string",
       "arity": "single",
