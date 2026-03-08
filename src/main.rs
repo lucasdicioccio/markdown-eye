@@ -177,6 +177,28 @@ impl eframe::App for FormApp {
                                     );
                                 }
                             }
+                            "datetime" => {
+                                if let FieldState::Text(ref mut s) = self.states[i] {
+                                    ui.add(
+                                        egui::TextEdit::singleline(s)
+                                            .hint_text("YYYY-MM-DD HH:MM"),
+                                    );
+                                }
+                            }
+                            "file-location" => {
+                                if let FieldState::Text(ref mut s) = self.states[i] {
+                                    ui.horizontal(|ui| {
+                                        ui.text_edit_singleline(s);
+                                        if ui.button("Browse…").clicked() {
+                                            if let Some(path) =
+                                                rfd::FileDialog::new().pick_file()
+                                            {
+                                                *s = path.to_string_lossy().into_owned();
+                                            }
+                                        }
+                                    });
+                                }
+                            }
                             "password" => {
                                 if let FieldState::Text(ref mut s) = self.states[i] {
                                     ui.add(egui::TextEdit::singleline(s).password(true));
@@ -473,6 +495,15 @@ Supported field types:
                 default: any string (may include newlines).
                 output:  string (newlines preserved).
 
+  datetime      Single-line text input with a "YYYY-MM-DD HH:MM" hint.
+                default: any string conforming to the format.
+                output:  string (the typed value, no validation).
+
+  file-location Single-line text input with a "Browse…" button that opens
+                a native file-picker dialog.
+                default: any string (pre-filled path).
+                output:  absolute path string.
+
   password      Masked single-line text input.
                 default: any string.
                 output:  string.
@@ -543,7 +574,7 @@ fn main() {
   "args": [
     {{
       "name": "content",
-      "description": "Markdown content to display. Optionally include a ```form block with a JSON object {{\"fields\": [...]}} to define interactive form fields. Supported field types: entry (text input), textarea (multi-line text input), password (hidden input), question (yes/no checkbox), list (dropdown, requires \"options\" array). NOTE: ignored entirely when --mode echo-instructions is set.",
+      "description": "Markdown content to display. Optionally include a ```form block with a JSON object {{\"fields\": [...]}} to define interactive form fields. Supported field types: entry (text input), textarea (multi-line text input), datetime (text input with YYYY-MM-DD HH:MM hint), file-location (text input + native file picker), password (hidden input), question (yes/no checkbox), list (dropdown, requires \"options\" array). NOTE: ignored entirely when --mode echo-instructions is set.",
       "type": "string",
       "backing_type": "string",
       "arity": "single",

@@ -117,6 +117,9 @@ The `form` block is stripped from the rendered markdown — only the surrounding
 | type | widget | output value |
 |---|---|---|
 | `entry` | single-line text input | string |
+| `textarea` | multi-line text input | string (newlines preserved) |
+| `datetime` | single-line text input with `YYYY-MM-DD HH:MM` hint | string (no validation) |
+| `file-location` | text input + native file-picker button | absolute path string |
 | `password` | masked text input | string |
 | `question` | checkbox | `"yes"` or `"no"` |
 | `list` | dropdown (requires `"options": [...]`) | selected option string |
@@ -131,9 +134,13 @@ Please review the diff above before proceeding.
 ```form
 {
   "fields": [
-    {"name": "env",     "type": "list",     "label": "Target environment", "options": ["staging", "production"]},
-    {"name": "tag",     "type": "entry",    "label": "Docker image tag",   "default": "latest"},
-    {"name": "confirm", "type": "question", "label": "I have reviewed the changes"}
+    {"name": "env",        "type": "list",          "label": "Target environment",  "options": ["staging", "production"]},
+    {"name": "tag",        "type": "entry",         "label": "Docker image tag",    "default": "latest"},
+    {"name": "deploy_at",  "type": "datetime",      "label": "Scheduled time",      "default": "2026-03-08 14:00"},
+    {"name": "config",     "type": "file-location", "label": "Config file"},
+    {"name": "notes",      "type": "textarea",      "label": "Release notes"},
+    {"name": "token",      "type": "password",      "label": "Deploy token"},
+    {"name": "confirm",    "type": "question",      "label": "I have reviewed the changes"}
   ]
 }
 ```
@@ -142,7 +149,7 @@ Please review the diff above before proceeding.
 Stdout on submit:
 
 ```json
-{"env":"production","tag":"v1.2.3","confirm":"yes"}
+{"env":"production","tag":"v1.2.3","deploy_at":"2026-03-08 14:00","config":"/etc/app/prod.toml","notes":"Bumps rate limiter","token":"***","confirm":"yes"}
 ```
 
 ---
@@ -166,7 +173,7 @@ markdown-eye describe
   "args": [
     {
       "name": "content",
-      "description": "Markdown content to display. Optionally include a ```form block with a JSON object {\"fields\": [...]} to define interactive form fields. NOTE: ignored entirely when --mode echo-instructions is set.",
+      "description": "Markdown content to display. Optionally include a ```form block with a JSON object {\"fields\": [...]} to define interactive form fields. Supported field types: entry (text input), textarea (multi-line text input), datetime (text input with YYYY-MM-DD HH:MM hint), file-location (text input + native file picker), password (hidden input), question (yes/no checkbox), list (dropdown, requires \"options\" array). NOTE: ignored entirely when --mode echo-instructions is set.",
       "type": "string",
       "backing_type": "string",
       "arity": "single",

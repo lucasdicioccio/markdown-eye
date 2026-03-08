@@ -37,6 +37,22 @@ Please fill in all fields below and click **Submit** when done.
       "label": "Session passphrase"
     },
     {
+      "name":    "scheduled_at",
+      "type":    "datetime",
+      "label":   "Scheduled deployment time",
+      "default": "2026-03-08 14:00"
+    },
+    {
+      "name":    "config_file",
+      "type":    "file-location",
+      "label":   "Configuration file"
+    },
+    {
+      "name":    "notes",
+      "type":    "textarea",
+      "label":   "Additional notes"
+    },
+    {
       "name":    "environment",
       "type":    "list",
       "label":   "Target environment",
