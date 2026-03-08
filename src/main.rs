@@ -1,47 +1,236 @@
 use std::{
     fs,
     path::PathBuf,
-    sync::mpsc::{self, Receiver},
+    sync::{
+        mpsc::{self, Receiver},
+        Arc, Mutex,
+    },
 };
 
 use clap::{Parser, Subcommand};
 use eframe::egui;
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use serde::Deserialize;
 
-#[derive(Parser)]
-#[command(name = "markdown-eye", version, about = "A markdown file viewer")]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
+// ── Form schema ───────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, Clone)]
+struct FormField {
+    name: String,
+    #[serde(rename = "type")]
+    field_type: String,
+    label: String,
+    #[serde(default)]
+    default: String,
+    #[serde(default)]
+    options: Vec<String>,
 }
 
-#[derive(Subcommand)]
-enum Commands {
-    /// Print tool description as JSON (agents-exe binary tool protocol)
-    Describe,
-    /// Display markdown content read from stdin
-    Run {
-        /// Portrait window proportions (~800x1100)
-        #[arg(long, conflicts_with = "landscape")]
-        portrait: bool,
-        /// Landscape window proportions (~1200x800, default)
-        #[arg(long, conflicts_with = "portrait")]
-        landscape: bool,
-    },
-    /// Display one or more markdown files
-    View {
-        /// One or more markdown files to display
-        #[arg(required = true, value_name = "FILES")]
-        files: Vec<PathBuf>,
-        /// Portrait window proportions (~800x1100)
-        #[arg(long, conflicts_with = "landscape")]
-        portrait: bool,
-        /// Landscape window proportions (~1200x800, default)
-        #[arg(long, conflicts_with = "portrait")]
-        landscape: bool,
-    },
+#[derive(Deserialize)]
+struct FormSchema {
+    fields: Vec<FormField>,
 }
+
+enum FieldState {
+    Text(String),
+    Bool(bool),
+    Choice(usize),
+}
+
+/// Scan `content` for a fenced ` ```form ` block containing JSON.
+/// Returns `(Some(schema), markdown_without_block)` on success,
+/// or `(None, content)` if no valid form block is found.
+fn extract_form_schema(content: &str) -> (Option<FormSchema>, String) {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut form_start: Option<usize> = None;
+    let mut form_end: Option<usize> = None;
+
+    for (i, line) in lines.iter().enumerate() {
+        if line.trim() == "```form" {
+            form_start = Some(i);
+        } else if form_start.is_some() && line.trim() == "```" {
+            form_end = Some(i);
+            break;
+        }
+    }
+
+    if let (Some(start), Some(end)) = (form_start, form_end) {
+        let json_str = lines[start + 1..end].join("\n");
+        if let Ok(schema) = serde_json::from_str::<FormSchema>(&json_str) {
+            let mut remaining: Vec<&str> = Vec::new();
+            remaining.extend_from_slice(&lines[..start]);
+            remaining.extend_from_slice(&lines[end + 1..]);
+            let cleaned = remaining.join("\n").trim().to_string();
+            return (Some(schema), cleaned);
+        }
+    }
+
+    (None, content.to_string())
+}
+
+// ── Form app ──────────────────────────────────────────────────────────────────
+
+struct FormApp {
+    markdown_content: String,
+    cache: CommonMarkCache,
+    fields: Vec<FormField>,
+    states: Vec<FieldState>,
+    dark_mode: bool,
+    result: Arc<Mutex<Option<String>>>,
+}
+
+impl FormApp {
+    fn new(
+        markdown_content: String,
+        schema: FormSchema,
+        result: Arc<Mutex<Option<String>>>,
+    ) -> Self {
+        let states = schema
+            .fields
+            .iter()
+            .map(|f| match f.field_type.as_str() {
+                "question" => FieldState::Bool(f.default == "true"),
+                "list" => FieldState::Choice(0),
+                _ => FieldState::Text(f.default.clone()),
+            })
+            .collect();
+
+        Self {
+            markdown_content,
+            cache: CommonMarkCache::default(),
+            fields: schema.fields,
+            states,
+            dark_mode: false,
+            result,
+        }
+    }
+
+    fn collect_result(&self) -> String {
+        let mut map = serde_json::Map::new();
+        for (field, state) in self.fields.iter().zip(self.states.iter()) {
+            let value = match state {
+                FieldState::Text(s) => serde_json::Value::String(s.clone()),
+                FieldState::Bool(b) => serde_json::Value::String(
+                    if *b { "yes" } else { "no" }.to_string(),
+                ),
+                FieldState::Choice(idx) => {
+                    let opt = field.options.get(*idx).cloned().unwrap_or_default();
+                    serde_json::Value::String(opt)
+                }
+            };
+            map.insert(field.name.clone(), value);
+        }
+        serde_json::to_string(&serde_json::Value::Object(map)).unwrap()
+    }
+}
+
+impl eframe::App for FormApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.dark_mode {
+            ctx.set_visuals(egui::Visuals::dark());
+        } else {
+            ctx.set_visuals(egui::Visuals::light());
+        }
+
+        egui::TopBottomPanel::top("header").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("Form");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let icon = if self.dark_mode { "☀" } else { "🌙" };
+                    if ui.button(icon).clicked() {
+                        self.dark_mode = !self.dark_mode;
+                    }
+                });
+            });
+        });
+
+        egui::TopBottomPanel::bottom("form_panel")
+            .resizable(true)
+            .min_height(150.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.add_space(4.0);
+
+                    for i in 0..self.fields.len() {
+                        // Clone the parts we need to avoid simultaneous borrows
+                        // while mutably accessing self.states[i].
+                        let field_type = self.fields[i].field_type.clone();
+                        let label = self.fields[i].label.clone();
+                        let name = self.fields[i].name.clone();
+                        let options = self.fields[i].options.clone();
+
+                        ui.label(&label);
+
+                        match field_type.as_str() {
+                            "entry" => {
+                                if let FieldState::Text(ref mut s) = self.states[i] {
+                                    ui.text_edit_singleline(s);
+                                }
+                            }
+                            "password" => {
+                                if let FieldState::Text(ref mut s) = self.states[i] {
+                                    ui.add(egui::TextEdit::singleline(s).password(true));
+                                }
+                            }
+                            "question" => {
+                                if let FieldState::Bool(ref mut b) = self.states[i] {
+                                    ui.checkbox(b, "");
+                                }
+                            }
+                            "list" => {
+                                if let FieldState::Choice(ref mut idx) = self.states[i] {
+                                    let selected = options
+                                        .get(*idx)
+                                        .map(|s| s.as_str())
+                                        .unwrap_or("");
+                                    egui::ComboBox::from_id_salt(&name)
+                                        .selected_text(selected)
+                                        .show_ui(ui, |ui| {
+                                            for (opt_i, opt) in options.iter().enumerate() {
+                                                ui.selectable_value(idx, opt_i, opt);
+                                            }
+                                        });
+                                }
+                            }
+                            other => {
+                                ui.label(format!("(unsupported field type: {other})"));
+                            }
+                        }
+
+                        ui.add_space(6.0);
+                    }
+
+                    ui.separator();
+                    ui.add_space(4.0);
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Submit").clicked() {
+                            let json = self.collect_result();
+                            *self.result.lock().unwrap() = Some(json);
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    });
+
+                    ui.add_space(4.0);
+                });
+            });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
+                    CommonMarkViewer::new()
+                        .show(ui, &mut self.cache, &self.markdown_content);
+                });
+        });
+    }
+}
+
+// ── Markdown viewer app ───────────────────────────────────────────────────────
 
 struct FileTab {
     path: PathBuf,
@@ -123,7 +312,6 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Drain reload events
         while let Ok(changed_path) = self.reload_rx.try_recv() {
             for tab in &mut self.tabs {
                 if let (Ok(a), Ok(b)) = (tab.path.canonicalize(), changed_path.canonicalize()) {
@@ -135,14 +323,12 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
 
-        // Apply theme
         if self.dark_mode {
             ctx.set_visuals(egui::Visuals::dark());
         } else {
             ctx.set_visuals(egui::Visuals::light());
         }
 
-        // Top panel: tabs + theme toggle
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 for i in 0..self.tabs.len() {
@@ -162,7 +348,6 @@ impl eframe::App for App {
             });
         });
 
-        // Main content
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink([false; 2])
@@ -172,6 +357,59 @@ impl eframe::App for App {
                 });
         });
     }
+}
+
+// ── CLI ───────────────────────────────────────────────────────────────────────
+
+/// Operating mode for the `run` command.
+#[derive(clap::ValueEnum, Clone)]
+enum RunMode {
+    /// Render stdin as plain markdown; form blocks are ignored.
+    View,
+    /// Parse and display the interactive form embedded in the markdown.
+    Form,
+    /// Print the form-authoring guide to stdout and exit; stdin is not read.
+    EchoInstructions,
+}
+
+#[derive(Parser)]
+#[command(name = "markdown-eye", version, about = "A markdown file viewer")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Print tool description as JSON (agents-exe binary tool protocol)
+    Describe,
+    /// Display markdown content read from stdin.
+    ///
+    /// Default behaviour auto-detects a ```form block and switches to form
+    /// mode when one is present.  Use --mode to override.
+    Run {
+        /// Portrait window proportions (~800x1100)
+        #[arg(long, conflicts_with = "landscape")]
+        portrait: bool,
+        /// Landscape window proportions (~1200x800, default)
+        #[arg(long, conflicts_with = "portrait")]
+        landscape: bool,
+        /// Operating mode (default: auto-detect)
+        #[arg(long, value_enum)]
+        mode: Option<RunMode>,
+    },
+    /// Display one or more markdown files
+    View {
+        /// One or more markdown files to display
+        #[arg(required = true, value_name = "FILES")]
+        files: Vec<PathBuf>,
+        /// Portrait window proportions (~800x1100)
+        #[arg(long, conflicts_with = "landscape")]
+        portrait: bool,
+        /// Landscape window proportions (~1200x800, default)
+        #[arg(long, conflicts_with = "portrait")]
+        landscape: bool,
+    },
 }
 
 fn window_dims(portrait: bool) -> (f32, f32) {
@@ -194,40 +432,189 @@ fn launch(tabs: Vec<FileTab>, portrait: bool) {
     .unwrap();
 }
 
+fn print_form_instructions() {
+    print!(
+        r#"markdown-eye — form block authoring guide
+==========================================
+
+Embed a ```form fenced code block anywhere in your markdown. It is stripped
+from the rendered content; only the surrounding markdown is displayed.
+
+    ```form
+    {{
+      "fields": [ ... ]
+    }}
+    ```
+
+Each element of "fields" is a JSON object with these properties:
+
+  name     (string,  required) — key used in the output JSON
+  type     (string,  required) — widget type; see below
+  label    (string,  required) — text shown next to the widget
+  default  (string,  optional) — pre-filled value
+  options  (array,   required for "list") — list of selectable strings
+
+Supported field types:
+
+  entry         Single-line text input.
+                default: any string.
+                output:  string.
+
+  password      Masked single-line text input.
+                default: any string.
+                output:  string.
+
+  question      Checkbox (yes / no).
+                default: "true" pre-checks the box; any other value leaves it unchecked.
+                output:  "yes" or "no".
+
+  list          Dropdown selector.
+                options: required — JSON array of strings, e.g. ["a", "b", "c"].
+                default: ignored (first option is selected by default).
+                output:  the selected option string.
+
+Output
+------
+On Submit the tool prints a compact JSON object to stdout, one key per field:
+
+    {{"username":"alice","confirmed":"yes","env":"production"}}
+
+On Cancel or window close the process exits with code 1.
+
+Full example
+------------
+
+    ```form
+    {{
+      "fields": [
+        {{"name": "username",  "type": "entry",    "label": "Username",          "default": "alice"}},
+        {{"name": "token",     "type": "password", "label": "API token"}},
+        {{"name": "env",       "type": "list",     "label": "Target environment","options": ["staging","production"]}},
+        {{"name": "confirmed", "type": "question", "label": "I have reviewed the diff"}}
+      ]
+    }}
+    ```
+"#
+    );
+}
+
 fn main() {
-    let cli = Cli::parse();
+    // Friendly argument fallbacks:
+    //   no args          → behave as `run`  (read markdown from stdin)
+    //   unknown first arg → behave as `view` (treat all args as file paths)
+    let raw: Vec<String> = std::env::args().collect();
+    let effective: Vec<String> = if raw.len() == 1 {
+        vec![raw[0].clone(), "run".to_string()]
+    } else {
+        let is_known = matches!(
+            raw[1].as_str(),
+            "describe" | "run" | "view" | "help" | "--help" | "-h" | "--version" | "-V"
+        );
+        if is_known {
+            raw
+        } else {
+            let mut v = vec![raw[0].clone(), "view".to_string()];
+            v.extend_from_slice(&raw[1..]);
+            v
+        }
+    };
+
+    let cli = Cli::parse_from(effective);
 
     match cli.command {
         Commands::Describe => {
             println!(
                 r#"{{
   "slug": "markdown-eye",
-  "description": "Opens a GUI window to render and display markdown content",
+  "description": "Opens a GUI window to render markdown content. When the markdown contains a ```form JSON block defining fields (entry, password, question, list), it shows an interactive form alongside the content and prints the user's answers as a JSON object to stdout on submit.",
   "args": [
     {{
       "name": "content",
-      "description": "The markdown content to display",
+      "description": "Markdown content to display. Optionally include a ```form block with a JSON object {{\"fields\": [...]}} to define interactive form fields. Supported field types: entry (text input), password (hidden input), question (yes/no checkbox), list (dropdown, requires \"options\" array). NOTE: ignored entirely when --mode echo-instructions is set.",
       "type": "string",
       "backing_type": "string",
       "arity": "single",
       "mode": "stdin"
+    }},
+    {{
+      "name": "mode",
+      "description": "Operating mode. 'view': render markdown only, form blocks are ignored. 'form': show the interactive form defined in the ```form block. 'echo-instructions': print the form-authoring guide to stdout and exit — content is NOT read from stdin and the content argument is ignored entirely.",
+      "type": "string",
+      "backing_type": "string",
+      "arity": "optional",
+      "mode": "dashdashspace"
     }}
-  ]
+  ],
+  "empty-result": {{
+    "tag": "AddMessage",
+    "contents": "User cancelled the form or closed the window without submitting"
+  }}
 }}"#
             );
         }
 
-        Commands::Run { portrait, .. } => {
+        Commands::Run { portrait, mode, .. } => {
+            // echo-instructions: no stdin needed, just print the guide and exit.
+            if matches!(mode, Some(RunMode::EchoInstructions)) {
+                print_form_instructions();
+                return;
+            }
+
             let content = fs::read_to_string("/dev/stdin").unwrap_or_else(|e| {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             });
-            let tab = FileTab {
-                path: PathBuf::from("/dev/stdin"),
-                content,
-                cache: CommonMarkCache::default(),
+
+            // Determine whether to show a form based on explicit mode or auto-detection.
+            let use_form = match mode {
+                Some(RunMode::Form) => true,
+                Some(RunMode::View) => false,
+                _ => {
+                    // Auto-detect: use form mode only if a valid form block is present.
+                    let (schema, _) = extract_form_schema(&content);
+                    schema.is_some()
+                }
             };
-            launch(vec![tab], portrait);
+
+            if use_form {
+                let (schema, markdown) = extract_form_schema(&content);
+                let schema = schema.unwrap_or_else(|| {
+                    eprintln!("error: --mode form requested but no valid ```form block found in input");
+                    std::process::exit(1);
+                });
+
+                let result: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+                let result_clone = result.clone();
+
+                let (width, height) = window_dims(portrait);
+                let options = eframe::NativeOptions {
+                    viewport: egui::ViewportBuilder::default()
+                        .with_title("markdown-eye")
+                        .with_inner_size([width, height]),
+                    ..Default::default()
+                };
+                eframe::run_native(
+                    "markdown-eye",
+                    options,
+                    Box::new(|_cc| {
+                        Ok(Box::new(FormApp::new(markdown, schema, result_clone)))
+                    }),
+                )
+                .unwrap();
+
+                let output = result.lock().unwrap().take();
+                match output {
+                    Some(json) => println!("{json}"),
+                    None => std::process::exit(1),
+                }
+            } else {
+                let tab = FileTab {
+                    path: PathBuf::from("/dev/stdin"),
+                    content,
+                    cache: CommonMarkCache::default(),
+                };
+                launch(vec![tab], portrait);
+            }
         }
 
         Commands::View { files, portrait, .. } => {
