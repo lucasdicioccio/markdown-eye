@@ -265,6 +265,7 @@ impl eframe::App for FormApp {
 
 struct FileTab {
     path: PathBuf,
+    url: Option<String>,
     content: String,
     cache: CommonMarkCache,
 }
@@ -275,12 +276,30 @@ impl FileTab {
             .map_err(|e| format!("{}: {}", path.display(), e))?;
         Ok(Self {
             path,
+            url: None,
+            content,
+            cache: CommonMarkCache::default(),
+        })
+    }
+
+    fn load_url(url: String) -> Result<Self, String> {
+        let content = ureq::get(&url)
+            .call()
+            .map_err(|e| format!("{url}: {e}"))?
+            .into_string()
+            .map_err(|e| format!("{url}: {e}"))?;
+        Ok(Self {
+            path: PathBuf::new(),
+            url: Some(url),
             content,
             cache: CommonMarkCache::default(),
         })
     }
 
     fn reload(&mut self) {
+        if self.url.is_some() {
+            return;
+        }
         if let Ok(content) = fs::read_to_string(&self.path) {
             self.content = content;
             self.cache = CommonMarkCache::default();
@@ -288,10 +307,18 @@ impl FileTab {
     }
 
     fn display_name(&self) -> &str {
-        self.path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("?")
+        if let Some(url) = &self.url {
+            url.trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(url.as_str())
+        } else {
+            self.path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("?")
+        }
     }
 }
 
@@ -307,7 +334,11 @@ impl App {
     fn new(tabs: Vec<FileTab>, dark_mode: bool) -> Self {
         let (tx, rx) = mpsc::channel::<PathBuf>();
 
-        let watched_paths: Vec<PathBuf> = tabs.iter().map(|t| t.path.clone()).collect();
+        let watched_paths: Vec<PathBuf> = tabs
+            .iter()
+            .filter(|t| t.url.is_none())
+            .map(|t| t.path.clone())
+            .collect();
 
         let watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
             if let Ok(event) = res {
@@ -654,6 +685,7 @@ fn main() {
             } else {
                 let tab = FileTab {
                     path: PathBuf::from("/dev/stdin"),
+                    url: None,
                     content,
                     cache: CommonMarkCache::default(),
                 };
@@ -664,7 +696,8 @@ fn main() {
         Commands::View { files, portrait, .. } => {
             let mut errors = Vec::new();
             for path in &files {
-                if !path.exists() {
+                let s = path.to_string_lossy();
+                if !s.starts_with("http://") && !s.starts_with("https://") && !path.exists() {
                     errors.push(format!("File not found: {}", path.display()));
                 }
             }
@@ -677,11 +710,24 @@ fn main() {
 
             let tabs: Vec<FileTab> = files
                 .into_iter()
-                .filter_map(|p| match FileTab::load(p) {
-                    Ok(t) => Some(t),
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        None
+                .filter_map(|p| {
+                    let s = p.to_string_lossy();
+                    if s.starts_with("http://") || s.starts_with("https://") {
+                        match FileTab::load_url(s.into_owned()) {
+                            Ok(t) => Some(t),
+                            Err(e) => {
+                                eprintln!("error: {e}");
+                                None
+                            }
+                        }
+                    } else {
+                        match FileTab::load(p) {
+                            Ok(t) => Some(t),
+                            Err(e) => {
+                                eprintln!("error: {e}");
+                                None
+                            }
+                        }
                     }
                 })
                 .collect();
