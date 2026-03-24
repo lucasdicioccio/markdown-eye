@@ -15,6 +15,12 @@ use serde::Deserialize;
 
 // ── Table extraction & copy helpers ───────────────────────────────────────────
 
+struct TocSection {
+    level: u8,       // 0 = preamble (before any heading), 1–3 = heading level
+    heading: String, // heading text (empty for preamble)
+    segments: Vec<Segment>,
+}
+
 enum Segment {
     Markdown(String),
     Table {
@@ -143,6 +149,49 @@ fn render_segments(ui: &mut egui::Ui, cache: &mut CommonMarkCache, segments: &[S
             }
         }
     }
+}
+
+/// Parse a line as a heading (levels 1–3 only). Returns `(level, text)`.
+fn parse_heading_line(line: &str) -> Option<(u8, String)> {
+    let trimmed = line.trim_start();
+    let hashes = trimmed.bytes().take_while(|&b| b == b'#').count() as u8;
+    if hashes == 0 || hashes > 3 {
+        return None;
+    }
+    let rest = &trimmed[hashes as usize..];
+    if !rest.is_empty() && !rest.starts_with(' ') {
+        return None; // `#title` without space is not a heading
+    }
+    Some((hashes, rest.trim().to_string()))
+}
+
+/// Split content into sections at h1–h3 heading boundaries.
+/// The first section may have `level == 0` (preamble before any heading).
+fn parse_toc_sections(content: &str) -> Vec<TocSection> {
+    let mut sections: Vec<TocSection> = Vec::new();
+    let mut current_lines: Vec<&str> = Vec::new();
+    let mut current_level: u8 = 0;
+    let mut current_heading = String::new();
+
+    for line in content.lines() {
+        if let Some((level, heading)) = parse_heading_line(line) {
+            sections.push(TocSection {
+                level: current_level,
+                heading: current_heading.clone(),
+                segments: parse_segments(&current_lines.join("\n")),
+            });
+            current_lines.clear();
+            current_level = level;
+            current_heading = heading;
+        }
+        current_lines.push(line);
+    }
+    sections.push(TocSection {
+        level: current_level,
+        heading: current_heading,
+        segments: parse_segments(&current_lines.join("\n")),
+    });
+    sections
 }
 
 // ── Form schema ───────────────────────────────────────────────────────────────
@@ -400,20 +449,22 @@ struct FileTab {
     url: Option<String>,
     content: String,
     cache: CommonMarkCache,
-    segments: Vec<Segment>,
+    toc_sections: Vec<TocSection>,
+    scroll_to: Option<usize>,
 }
 
 impl FileTab {
     fn load(path: PathBuf) -> Result<Self, String> {
         let content = fs::read_to_string(&path)
             .map_err(|e| format!("{}: {}", path.display(), e))?;
-        let segments = parse_segments(&content);
+        let toc_sections = parse_toc_sections(&content);
         Ok(Self {
             path,
             url: None,
             content,
             cache: CommonMarkCache::default(),
-            segments,
+            toc_sections,
+            scroll_to: None,
         })
     }
 
@@ -423,13 +474,14 @@ impl FileTab {
             .map_err(|e| format!("{url}: {e}"))?
             .into_string()
             .map_err(|e| format!("{url}: {e}"))?;
-        let segments = parse_segments(&content);
+        let toc_sections = parse_toc_sections(&content);
         Ok(Self {
             path: PathBuf::new(),
             url: Some(url),
             content,
             cache: CommonMarkCache::default(),
-            segments,
+            toc_sections,
+            scroll_to: None,
         })
     }
 
@@ -438,9 +490,10 @@ impl FileTab {
             return;
         }
         if let Ok(content) = fs::read_to_string(&self.path) {
-            self.segments = parse_segments(&content);
+            self.toc_sections = parse_toc_sections(&content);
             self.content = content;
             self.cache = CommonMarkCache::default();
+            self.scroll_to = None;
         }
     }
 
@@ -466,6 +519,7 @@ struct App {
     _watcher: Option<RecommendedWatcher>,
     reload_rx: Receiver<PathBuf>,
     dark_mode: bool,
+    show_toc: bool,
 }
 
 impl App {
@@ -506,6 +560,7 @@ impl App {
             _watcher: watcher,
             reload_rx: rx,
             dark_mode,
+            show_toc: true,
         }
     }
 }
@@ -544,16 +599,82 @@ impl eframe::App for App {
                     if ui.button(icon).clicked() {
                         self.dark_mode = !self.dark_mode;
                     }
+                    let has_toc = self.tabs[self.active]
+                        .toc_sections
+                        .iter()
+                        .any(|s| s.level > 0);
+                    if has_toc {
+                        let toc_icon = if self.show_toc { "≡·" } else { "≡" };
+                        ui.toggle_value(&mut self.show_toc, toc_icon)
+                            .on_hover_text("Toggle table of contents");
+                    }
                 });
             });
         });
+
+        // TOC sidebar — only shown when the active tab has heading sections and show_toc is on
+        let has_toc = self.tabs[self.active]
+            .toc_sections
+            .iter()
+            .any(|s| s.level > 0);
+
+        if has_toc && self.show_toc {
+            let mut clicked_section: Option<usize> = None;
+            egui::SidePanel::left("toc")
+                .resizable(true)
+                .default_width(180.0)
+                .show(ctx, |ui| {
+                    ui.add_space(4.0);
+                    ui.strong("Contents");
+                    ui.separator();
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        let tab = &self.tabs[self.active];
+                        for (i, section) in tab.toc_sections.iter().enumerate() {
+                            if section.level == 0 {
+                                continue;
+                            }
+                            let indent = (section.level - 1) as f32 * 14.0;
+                            ui.horizontal(|ui| {
+                                ui.add_space(indent);
+                                let link_color = if ui.visuals().dark_mode {
+                                    ui.visuals().hyperlink_color
+                                } else {
+                                    egui::Color32::from_rgb(70, 110, 160)
+                                };
+                                let label = egui::Label::new(
+                                    egui::RichText::new(&section.heading)
+                                        .small()
+                                        .color(link_color),
+                                )
+                                .sense(egui::Sense::click())
+                                .truncate();
+                                let response = ui
+                                    .add(label)
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                if response.clicked() {
+                                    clicked_section = Some(i);
+                                }
+                            });
+                        }
+                    });
+                });
+            if let Some(idx) = clicked_section {
+                self.tabs[self.active].scroll_to = Some(idx);
+            }
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink([false; 2])
                 .show(ui, |ui| {
                     let tab = &mut self.tabs[self.active];
-                    render_segments(ui, &mut tab.cache, &tab.segments);
+                    let scroll_to = tab.scroll_to.take();
+                    for (i, section) in tab.toc_sections.iter().enumerate() {
+                        if scroll_to == Some(i) {
+                            ui.scroll_to_cursor(Some(egui::Align::TOP));
+                        }
+                        render_segments(ui, &mut tab.cache, &section.segments);
+                    }
                 });
         });
     }
@@ -821,13 +942,14 @@ fn main() {
                     None => std::process::exit(1),
                 }
             } else {
-                let segments = parse_segments(&content);
+                let toc_sections = parse_toc_sections(&content);
                 let tab = FileTab {
                     path: PathBuf::from("/dev/stdin"),
                     url: None,
                     content,
                     cache: CommonMarkCache::default(),
-                    segments,
+                    toc_sections,
+                    scroll_to: None,
                 };
                 launch(vec![tab], portrait);
             }
