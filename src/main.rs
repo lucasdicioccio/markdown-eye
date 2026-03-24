@@ -13,6 +13,138 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Deserialize;
 
+// ── Table extraction & copy helpers ───────────────────────────────────────────
+
+enum Segment {
+    Markdown(String),
+    Table {
+        raw: String,
+        headers: Vec<String>,
+        rows: Vec<Vec<String>>,
+    },
+}
+
+fn is_table_separator(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with('|') && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
+}
+
+fn parse_table_row(line: &str) -> Vec<String> {
+    let t = line.trim();
+    let inner = t.strip_prefix('|').unwrap_or(t);
+    let inner = inner.strip_suffix('|').unwrap_or(inner);
+    inner.split('|').map(|s| s.trim().to_string()).collect()
+}
+
+fn parse_segments(content: &str) -> Vec<Segment> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut segments: Vec<Segment> = Vec::new();
+    let mut md_lines: Vec<&str> = Vec::new();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
+        let is_row = line.trim().starts_with('|');
+        let next_is_sep = i + 1 < lines.len() && is_table_separator(lines[i + 1]);
+
+        if is_row && next_is_sep {
+            if !md_lines.is_empty() {
+                segments.push(Segment::Markdown(md_lines.join("\n")));
+                md_lines.clear();
+            }
+
+            let headers = parse_table_row(lines[i]);
+            let mut raw_lines = vec![lines[i], lines[i + 1]];
+            let mut rows: Vec<Vec<String>> = Vec::new();
+            i += 2;
+
+            while i < lines.len() {
+                let l = lines[i];
+                if l.trim().starts_with('|') && !is_table_separator(l) {
+                    rows.push(parse_table_row(l));
+                    raw_lines.push(l);
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+
+            segments.push(Segment::Table {
+                raw: raw_lines.join("\n"),
+                headers,
+                rows,
+            });
+        } else {
+            md_lines.push(line);
+            i += 1;
+        }
+    }
+
+    if !md_lines.is_empty() {
+        segments.push(Segment::Markdown(md_lines.join("\n")));
+    }
+
+    segments
+}
+
+fn table_to_csv(headers: &[String], rows: &[Vec<String>]) -> String {
+    fn escape(s: &str) -> String {
+        if s.contains(',') || s.contains('"') || s.contains('\n') {
+            format!("\"{}\"", s.replace('"', "\"\""))
+        } else {
+            s.to_string()
+        }
+    }
+    let mut out = headers.iter().map(|h| escape(h)).collect::<Vec<_>>().join(",");
+    out.push('\n');
+    for row in rows {
+        out.push_str(&row.iter().map(|c| escape(c)).collect::<Vec<_>>().join(","));
+        out.push('\n');
+    }
+    out
+}
+
+fn table_to_json(headers: &[String], rows: &[Vec<String>]) -> String {
+    let arr: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            let mut map = serde_json::Map::new();
+            for (j, header) in headers.iter().enumerate() {
+                let val = row.get(j).cloned().unwrap_or_default();
+                map.insert(header.clone(), serde_json::Value::String(val));
+            }
+            serde_json::Value::Object(map)
+        })
+        .collect();
+    serde_json::to_string_pretty(&serde_json::Value::Array(arr)).unwrap()
+}
+
+fn render_segments(ui: &mut egui::Ui, cache: &mut CommonMarkCache, segments: &[Segment]) {
+    for segment in segments {
+        match segment {
+            Segment::Markdown(text) => {
+                CommonMarkViewer::new().show(ui, cache, text);
+            }
+            Segment::Table { raw, headers, rows } => {
+                ui.horizontal(|ui| {
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if ui.small_button("Copy JSON").clicked() {
+                                ui.ctx().copy_text(table_to_json(headers, rows));
+                            }
+                            if ui.small_button("Copy CSV").clicked() {
+                                ui.ctx().copy_text(table_to_csv(headers, rows));
+                            }
+                        },
+                    );
+                });
+                CommonMarkViewer::new().show(ui, cache, raw);
+            }
+        }
+    }
+}
+
 // ── Form schema ───────────────────────────────────────────────────────────────
 
 #[derive(Deserialize, Clone)]
@@ -72,7 +204,7 @@ fn extract_form_schema(content: &str) -> (Option<FormSchema>, String) {
 // ── Form app ──────────────────────────────────────────────────────────────────
 
 struct FormApp {
-    markdown_content: String,
+    segments: Vec<Segment>,
     cache: CommonMarkCache,
     fields: Vec<FormField>,
     states: Vec<FieldState>,
@@ -96,8 +228,9 @@ impl FormApp {
             })
             .collect();
 
+        let segments = parse_segments(&markdown_content);
         Self {
-            markdown_content,
+            segments,
             cache: CommonMarkCache::default(),
             fields: schema.fields,
             states,
@@ -254,8 +387,7 @@ impl eframe::App for FormApp {
             egui::ScrollArea::vertical()
                 .auto_shrink([false; 2])
                 .show(ui, |ui| {
-                    CommonMarkViewer::new()
-                        .show(ui, &mut self.cache, &self.markdown_content);
+                    render_segments(ui, &mut self.cache, &self.segments);
                 });
         });
     }
@@ -268,17 +400,20 @@ struct FileTab {
     url: Option<String>,
     content: String,
     cache: CommonMarkCache,
+    segments: Vec<Segment>,
 }
 
 impl FileTab {
     fn load(path: PathBuf) -> Result<Self, String> {
         let content = fs::read_to_string(&path)
             .map_err(|e| format!("{}: {}", path.display(), e))?;
+        let segments = parse_segments(&content);
         Ok(Self {
             path,
             url: None,
             content,
             cache: CommonMarkCache::default(),
+            segments,
         })
     }
 
@@ -288,11 +423,13 @@ impl FileTab {
             .map_err(|e| format!("{url}: {e}"))?
             .into_string()
             .map_err(|e| format!("{url}: {e}"))?;
+        let segments = parse_segments(&content);
         Ok(Self {
             path: PathBuf::new(),
             url: Some(url),
             content,
             cache: CommonMarkCache::default(),
+            segments,
         })
     }
 
@@ -301,6 +438,7 @@ impl FileTab {
             return;
         }
         if let Ok(content) = fs::read_to_string(&self.path) {
+            self.segments = parse_segments(&content);
             self.content = content;
             self.cache = CommonMarkCache::default();
         }
@@ -415,7 +553,7 @@ impl eframe::App for App {
                 .auto_shrink([false; 2])
                 .show(ui, |ui| {
                     let tab = &mut self.tabs[self.active];
-                    CommonMarkViewer::new().show(ui, &mut tab.cache, &tab.content);
+                    render_segments(ui, &mut tab.cache, &tab.segments);
                 });
         });
     }
@@ -683,11 +821,13 @@ fn main() {
                     None => std::process::exit(1),
                 }
             } else {
+                let segments = parse_segments(&content);
                 let tab = FileTab {
                     path: PathBuf::from("/dev/stdin"),
                     url: None,
                     content,
                     cache: CommonMarkCache::default(),
+                    segments,
                 };
                 launch(vec![tab], portrait);
             }
