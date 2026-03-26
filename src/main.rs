@@ -520,6 +520,7 @@ struct App {
     reload_rx: Receiver<PathBuf>,
     dark_mode: bool,
     show_toc: bool,
+    tab_search: String,
 }
 
 impl App {
@@ -561,6 +562,7 @@ impl App {
             reload_rx: rx,
             dark_mode,
             show_toc: true,
+            tab_search: String::new(),
         }
     }
 }
@@ -586,13 +588,36 @@ impl eframe::App for App {
 
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                for i in 0..self.tabs.len() {
-                    let name = self.tabs[i].display_name().to_owned();
-                    let selected = i == self.active;
-                    if ui.selectable_label(selected, &name).clicked() {
-                        self.active = i;
-                    }
-                }
+                let current_name = self.tabs[self.active].display_name().to_owned();
+                let btn = ui.button(format!("▾  {current_name}"));
+                let popup_id = egui::Popup::default_response_id(&btn);
+                let tab_search = &mut self.tab_search;
+                let tabs = &self.tabs;
+                let active = &mut self.active;
+                egui::Popup::from_toggle_button_response(&btn)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .layout(egui::Layout::top_down_justified(egui::Align::LEFT))
+                    .show(|ui| {
+                        ui.set_min_width(320.0);
+                        ui.add(
+                            egui::TextEdit::singleline(tab_search)
+                                .hint_text("Search…")
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.separator();
+                        let search = tab_search.to_lowercase();
+                        egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                            for i in 0..tabs.len() {
+                                let name = tabs[i].display_name().to_owned();
+                                if search.is_empty() || name.to_lowercase().contains(&search) {
+                                    if ui.selectable_value(active, i, &name).clicked() {
+                                        egui::Popup::close_id(ui.ctx(), popup_id);
+                                        tab_search.clear();
+                                    }
+                                }
+                            }
+                        });
+                    });
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let icon = if self.dark_mode { "☀" } else { "🌙" };
