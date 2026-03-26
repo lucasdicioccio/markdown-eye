@@ -1,23 +1,33 @@
 # markdown-eye
 
-A fast, native Linux markdown viewer built in Rust.
+A fast, native Linux markdown viewer built in Rust. Opens a GPU-accelerated GUI window to render markdown — from files, URLs, or stdin — with live reload, a table of contents, cross-file fuzzy search, interactive forms, and an [agents-exe](https://github.com/lucasdicioccio/agents-exe) integration.
 
 ## Features
 
-- Render one or more `.md` files in a native window
-- **Tabbed interface** — switch between files with a click
-- **Syntax highlighting** in code blocks
-- **Dark / Light theme toggle** (☀ / 🌙 button)
-- **Live reload** — the viewer updates automatically when a file changes on disk (`view` mode)
-- **stdin support** — pipe markdown directly into the viewer (`run` command)
-- **Interactive forms** — embed a `form` block in the markdown to present a GUI form; results are printed as JSON to stdout
+- **Multi-file viewer** — open any number of files as tabs, switch via a searchable dropdown
+- **Table of contents** — collapsible sidebar built from `#`/`##`/`###` headings; click to jump
+- **Search** — cross-file, typo-tolerant search powered by [sassy](https://crates.io/crates/sassy); distinct colours for exact vs approximate matches
+- **Table extraction** — copy any markdown table as CSV or JSON with one click
+- **URL support** — pass `http://`/`https://` URLs as file arguments
+- **Live reload** — files update automatically when saved; search index rebuilt on reload
+- **Interactive forms** — embed a `form` block to present a GUI form; results printed as JSON to stdout
 - **agents-exe integration** — implements the binary tool protocol (`describe` / `run`)
+- **Dark / Light theme** toggle
+- **Syntax highlighting** in code blocks
+
+## Installation
+
+```bash
+cargo install --path .
+# or just build:
+cargo build --release   # → ./target/release/markdown-eye
+```
 
 ## Usage
 
-### Quick start (shorthand invocation)
+### Quick start
 
-Subcommands are optional. The binary infers the right command from its arguments:
+Subcommands are optional — the binary infers the right command from its arguments:
 
 | Invocation | Equivalent to |
 |---|---|
@@ -29,42 +39,33 @@ Subcommands are optional. The binary infers the right command from its arguments
 # Pipe markdown from stdin
 echo "# Hello" | markdown-eye
 
-# Open a file directly
+# Open a single file
 markdown-eye README.md
 
 # Open multiple files as tabs
-markdown-eye README.md CHANGELOG.md docs/guide.md --portrait
+markdown-eye README.md CHANGELOG.md docs/guide.md
 ```
 
-### View files
+### `view` — Open one or more files
 
 ```bash
 markdown-eye view <FILES>... [--portrait|--landscape]
 ```
 
-```
-Arguments:
-  <FILES>...   One or more .md files to display
-
-Options:
-      --portrait   Portrait window proportions (~800x1100)
-      --landscape  Landscape window proportions (~1200x800, default)
-  -h, --help       Print help
-  -V, --version    Print version
-```
+Each argument can be a local path or an `http://`/`https://` URL. Multiple files are opened as tabs. Local files are watched for changes and reloaded automatically.
 
 ```bash
-# Portrait layout (tall, like A4 paper)
 markdown-eye view notes.md --portrait
+markdown-eye view README.md https://raw.githubusercontent.com/…/CHANGELOG.md
 ```
 
-### View from stdin
+### `run` — Render stdin
 
 ```bash
 markdown-eye run [--portrait|--landscape] [--mode view|form|echo-instructions]
 ```
 
-Reads all of stdin as markdown, then opens a GUI window with the rendered result.
+Reads all of stdin as markdown, then opens a window with the rendered result. If the content contains a [`form` block](#interactive-forms), the form UI is shown automatically (override with `--mode`).
 
 ```bash
 echo "# Hello" | markdown-eye run
@@ -72,75 +73,112 @@ cat report.md | markdown-eye run --portrait
 pandoc input.docx -t markdown | markdown-eye run
 ```
 
-#### `--mode`
-
-| value | behaviour |
+| `--mode` value | Behaviour |
 |---|---|
-| *(omitted)* | auto-detect: shows form panel if a `form` block is present, otherwise plain markdown |
-| `view` | render markdown only; `form` blocks are ignored |
-| `form` | always activate the form panel; exits with an error if no `form` block is found |
-| `echo-instructions` | print the form-authoring guide to stdout and exit — **stdin is not read** |
+| *(omitted)* | Auto-detect: form UI if a `form` block is found, plain view otherwise |
+| `view` | Plain markdown; `form` blocks are ignored |
+| `form` | Force form UI; exits with an error if no valid `form` block is found |
+| `echo-instructions` | Print the form-authoring guide to stdout and exit — **stdin is not read** |
 
-```bash
-# Get the form syntax guide (useful for LLM tool calls)
-markdown-eye run --mode echo-instructions
+### Window size
 
-# Force plain view even when a form block is present
-cat form-doc.md | markdown-eye run --mode view
-```
-
-### Interactive forms
-
-When the markdown piped to `run` contains a fenced ` ```form ` block with a JSON schema, the viewer renders the markdown alongside a form panel. On **Submit** the user's answers are printed as a JSON object to stdout. On **Cancel** (or closing the window), the process exits with code 1.
-
-#### Form block syntax
-
-````markdown
-```form
-{
-  "fields": [
-    {
-      "name":    "field_name",
-      "type":    "entry",
-      "label":   "Label shown in the UI",
-      "default": "optional default value"
-    }
-  ]
-}
-```
-````
-
-The `form` block is stripped from the rendered markdown — only the surrounding content is displayed.
-
-#### Supported field types
-
-| type | widget | output value |
+| Flag | Dimensions | Use case |
 |---|---|---|
-| `entry` | single-line text input | string |
-| `textarea` | multi-line text input | string (newlines preserved) |
-| `datetime` | single-line text input with `YYYY-MM-DD HH:MM` hint | string (no validation) |
-| `file-location` | text input + native file-picker button | absolute path string |
-| `password` | masked text input | string |
-| `question` | checkbox | `"yes"` or `"no"` |
-| `list` | dropdown (requires `"options": [...]`) | selected option string |
+| `--landscape` *(default)* | 1200 × 800 | Wide documents |
+| `--portrait` | 800 × 1100 | Long documents, A4-like layout |
 
-#### Example
+---
+
+## UI overview
+
+### File selector
+
+The **▾ filename** button in the top-left opens a dropdown listing all open files. A **"Search files…"** text box at the top of the dropdown filters by filename.
+
+When a [content search](#search) is active, each file in the list shows a match summary:
+
+| Suffix | Meaning |
+|---|---|
+| `(3)` | 3 sections with exact matches |
+| `(~2)` | 2 sections with approximate (fuzzy) matches |
+| `(2+~1)` | 2 exact + 1 approximate |
+
+### Table of contents
+
+Documents with `#`, `##`, or `###` headings get a collapsible TOC sidebar. Click any entry to scroll there. Toggle it with the **≡** button (top-right, only shown when the document has headings).
+
+Matching sections are colour-coded when a search is active — see [Search highlighting](#highlighting).
+
+### Table extraction
+
+Markdown tables are parsed automatically. Two copy buttons appear above each table:
+
+- **Copy CSV** — RFC 4180 compliant; cells with commas or quotes are quoted and escaped
+- **Copy JSON** — Array of objects, one key per header column
+
+### Dark mode
+
+Toggle between light and dark themes with the **🌙 / ☀** button (top-right). Defaults to light.
+
+---
+
+## Search
+
+A **🔍 Search…** bar is always visible in the top bar.
+
+| Shortcut | Action |
+|---|---|
+| **Ctrl+F** | Focus the search bar |
+| **Escape** | Clear the query (when the search bar is focused) |
+
+### Typo tolerance
+
+Search uses [sassy](https://crates.io/crates/sassy) for SIMD-accelerated approximate string matching. The edit-distance budget scales with query length:
+
+| Query length | Budget (k) | Effect |
+|---|---|---|
+| < 4 chars | 0 | Exact matches only (avoids noise on very short queries) |
+| ≥ 4 chars | 1 | One insertion, deletion, or substitution tolerated |
+
+Matches are classified by their minimum edit cost:
+
+- **Exact** (cost = 0) — query appears verbatim (case-insensitive)
+- **Approximate** (cost ≥ 1) — matched via one edit, likely a typo
+
+### Navigation
+
+**▲ / ▼** buttons step through matching sections in the current file. The counter shows position and a breakdown by quality:
+
+```
+3/7 · 5 exact + ~2 approx · 4 files
+```
+
+Typing auto-scrolls to the first match. Switching files resets the counter for that file.
+
+### Highlighting
+
+Exact and approximate matches use distinct colour schemes throughout the UI:
+
+| Location | Exact match | Approximate match |
+|---|---|---|
+| TOC entry | Amber; bright orange + bold when active | Muted blue; bright blue + bold when active |
+| Content section | Yellow tint + amber border | Blue tint + blue border |
+| Active section | More saturated, stronger border | Same, in blue |
+
+---
+
+## Interactive forms
+
+Embed a `form` fenced code block in your markdown to present an interactive form panel. The block is stripped from the rendered content — only the surrounding markdown is shown. On **Submit** the answers are printed as compact JSON to stdout. On **Cancel** or window close, the process exits with code 1 and prints nothing.
 
 ````markdown
-# Deploy confirmation
-
-Please review the diff above before proceeding.
-
 ```form
 {
   "fields": [
-    {"name": "env",        "type": "list",          "label": "Target environment",  "options": ["staging", "production"]},
-    {"name": "tag",        "type": "entry",         "label": "Docker image tag",    "default": "latest"},
-    {"name": "deploy_at",  "type": "datetime",      "label": "Scheduled time",      "default": "2026-03-08 14:00"},
-    {"name": "config",     "type": "file-location", "label": "Config file"},
-    {"name": "notes",      "type": "textarea",      "label": "Release notes"},
-    {"name": "token",      "type": "password",      "label": "Deploy token"},
-    {"name": "confirm",    "type": "question",      "label": "I have reviewed the changes"}
+    {"name": "username", "type": "entry",    "label": "Username",    "default": "alice"},
+    {"name": "token",    "type": "password", "label": "API token"},
+    {"name": "env",      "type": "list",     "label": "Environment", "options": ["staging", "production"]},
+    {"name": "confirm",  "type": "question", "label": "I have reviewed the diff"}
   ]
 }
 ```
@@ -149,18 +187,58 @@ Please review the diff above before proceeding.
 Stdout on submit:
 
 ```json
-{"env":"production","tag":"v1.2.3","deploy_at":"2026-03-08 14:00","config":"/etc/app/prod.toml","notes":"Bumps rate limiter","token":"***","confirm":"yes"}
+{"username":"alice","token":"s3cr3t","env":"production","confirm":"yes"}
 ```
+
+### Field types
+
+| `type` | Widget | Output | Notes |
+|---|---|---|---|
+| `entry` | Single-line text | string | `default` pre-fills |
+| `textarea` | Multi-line text | string (newlines preserved) | `default` pre-fills |
+| `datetime` | Single-line text | string (no validation) | Hint: `YYYY-MM-DD HH:MM` |
+| `file-location` | Text + **Browse…** button | absolute path string | Opens native file picker |
+| `password` | Masked single-line text | string | `default` pre-fills (hidden) |
+| `question` | Checkbox | `"yes"` or `"no"` | `"true"` pre-checks the box |
+| `list` | Dropdown | selected option string | Requires `"options": [...]`; first option default |
+
+All fields require `name`, `type`, and `label`. `default` is optional. `options` is required for `list`.
+
+For a full reference with examples:
+
+```bash
+markdown-eye run --mode echo-instructions
+```
+
+### Full example
+
+````markdown
+# Deploy confirmation
+
+Please review the changes before proceeding.
+
+```form
+{
+  "fields": [
+    {"name": "env",       "type": "list",          "label": "Target environment",  "options": ["staging", "production"]},
+    {"name": "tag",       "type": "entry",         "label": "Docker image tag",    "default": "latest"},
+    {"name": "deploy_at", "type": "datetime",      "label": "Scheduled time",      "default": "2026-03-08 14:00"},
+    {"name": "config",    "type": "file-location", "label": "Config file"},
+    {"name": "notes",     "type": "textarea",      "label": "Release notes"},
+    {"name": "token",     "type": "password",      "label": "Deploy token"},
+    {"name": "confirm",   "type": "question",      "label": "I have reviewed the changes"}
+  ]
+}
+```
+````
 
 ---
 
-## agents-exe binary tool protocol
+## agents-exe integration
 
-`markdown-eye` implements the [agents-exe binary tool protocol](https://github.com/lucasdicioccio/agents-exe/blob/main/docs/binary-tool.md). Place the binary in a `tools/` directory alongside `agent.json` and agents-exe will discover and register it automatically.
+`markdown-eye` implements the [agents-exe binary tool protocol](https://github.com/lucasdicioccio/agents-exe/blob/main/docs/binary-tool.md). Drop the binary in a `tools/` directory alongside `agent.json` — agents-exe discovers and registers it automatically via `describe`.
 
-### describe
-
-When invoked with `describe` as the sole argument, the tool prints its interface description as JSON:
+### `describe`
 
 ```bash
 markdown-eye describe
@@ -173,7 +251,7 @@ markdown-eye describe
   "args": [
     {
       "name": "content",
-      "description": "Markdown content to display. Optionally include a ```form block with a JSON object {\"fields\": [...]} to define interactive form fields. Supported field types: entry (text input), textarea (multi-line text input), datetime (text input with YYYY-MM-DD HH:MM hint), file-location (text input + native file picker), password (hidden input), question (yes/no checkbox), list (dropdown, requires \"options\" array). NOTE: ignored entirely when --mode echo-instructions is set.",
+      "description": "Markdown content to display…",
       "type": "string",
       "backing_type": "string",
       "arity": "single",
@@ -181,7 +259,7 @@ markdown-eye describe
     },
     {
       "name": "mode",
-      "description": "Operating mode. 'view': render markdown only, form blocks are ignored. 'form': show the interactive form defined in the ```form block. 'echo-instructions': print the form-authoring guide to stdout and exit — content is NOT read from stdin and the content argument is ignored entirely.",
+      "description": "Operating mode. 'view' / 'form' / 'echo-instructions'.",
       "type": "string",
       "backing_type": "string",
       "arity": "optional",
@@ -195,43 +273,19 @@ markdown-eye describe
 }
 ```
 
-The `content` argument uses `mode: "stdin"` — agents-exe concatenates the markdown to stdin before calling `markdown-eye run`. The optional `mode` argument controls rendering behaviour; set it to `echo-instructions` to retrieve the form-authoring guide without opening a window (content is ignored in that case).
-
-### run
-
-agents-exe invokes the tool as:
-
-```bash
-markdown-eye run
-```
-
-with the markdown content piped to stdin. If the content contains a `form` block, the GUI presents the form and writes the result JSON to stdout when the user submits. Otherwise it simply renders the markdown.
+`content` uses `mode: "stdin"` — agents-exe pipes the markdown into `markdown-eye run`. The optional `mode` argument controls rendering; set it to `echo-instructions` to retrieve the form-authoring guide without opening a window.
 
 ---
-
-## Install
-
-### From source
-
-```bash
-git clone <repo>
-cd markdown-eye
-cargo install --path .
-```
-
-### Build only
-
-```bash
-cargo build --release
-# Binary at: ./target/release/markdown-eye
-```
 
 ## Dependencies
 
 | Crate | Purpose |
 |---|---|
-| [`eframe`](https://github.com/emilk/egui/tree/master/crates/eframe) | Native window / egui backend |
-| [`egui_commonmark`](https://github.com/lampsitter/egui_commonmark) | Commonmark markdown renderer |
-| [`clap`](https://github.com/clap-rs/clap) | CLI argument parsing |
+| [`eframe`](https://github.com/emilk/egui/tree/master/crates/eframe) | Native window / egui rendering backend |
+| [`egui_commonmark`](https://github.com/lampsitter/egui_commonmark) | CommonMark renderer with syntax highlighting |
+| [`sassy`](https://crates.io/crates/sassy) | SIMD-accelerated approximate string search |
 | [`notify`](https://github.com/notify-rs/notify) | File-system watcher for live reload |
+| [`rfd`](https://github.com/PolyMeilex/rfd) | Native file-picker dialog |
+| [`ureq`](https://github.com/algesten/ureq) | HTTP client for URL loading |
+| [`clap`](https://github.com/clap-rs/clap) | CLI argument parsing |
 | [`serde` / `serde_json`](https://serde.rs) | Form schema parsing and JSON output |

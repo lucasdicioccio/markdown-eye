@@ -11,6 +11,7 @@ use clap::{Parser, Subcommand};
 use eframe::egui;
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use sassy::{Searcher, profiles::Ascii};
 use serde::Deserialize;
 
 // ── Table extraction & copy helpers ───────────────────────────────────────────
@@ -192,6 +193,42 @@ fn parse_toc_sections(content: &str) -> Vec<TocSection> {
         segments: parse_segments(&current_lines.join("\n")),
     });
     sections
+}
+
+// ── Search helpers ────────────────────────────────────────────────────────────
+
+/// Concatenate a section's heading and all segment text for searching.
+fn section_text(section: &TocSection) -> String {
+    let mut text = section.heading.clone();
+    for seg in &section.segments {
+        text.push('\n');
+        match seg {
+            Segment::Markdown(s) => text.push_str(s),
+            Segment::Table { raw, .. } => text.push_str(raw),
+        }
+    }
+    text
+}
+
+/// Maximum edit-distance budget based on query length.
+/// Short queries use k=0 (exact only) to avoid false positives.
+fn search_k(query_len: usize) -> usize {
+    if query_len < 4 { 0 } else { 1 }
+}
+
+/// Return the minimum edit cost of any match of `query_lower` (already-lowercased bytes)
+/// in `content` at tolerance `k`, or `None` if there are no matches.
+fn best_match_cost(query_lower: &[u8], content: &str, k: usize) -> Option<usize> {
+    if query_lower.is_empty() || content.is_empty() {
+        return None;
+    }
+    let lower = content.to_lowercase();
+    let mut searcher = Searcher::<Ascii>::new_fwd();
+    searcher
+        .search(query_lower, lower.as_bytes(), k)
+        .iter()
+        .map(|m| m.cost as usize)
+        .min()
 }
 
 // ── Form schema ───────────────────────────────────────────────────────────────
@@ -521,6 +558,16 @@ struct App {
     dark_mode: bool,
     show_toc: bool,
     tab_search: String,
+    // Content search
+    search_query: String,
+    search_last_query: String,
+    /// Per-tab: `(section_idx, best_cost)` pairs sorted by section index.
+    /// cost == 0 → exact match; cost > 0 → approximate (typo-tolerant) match.
+    search_hits: Vec<Vec<(usize, usize)>>,
+    /// Which hit within `search_hits[active]` is the "active" (navigated-to) one.
+    search_nav_idx: usize,
+    /// Set when a tab reloads so search results are rebuilt next frame.
+    search_stale: bool,
 }
 
 impl App {
@@ -555,6 +602,7 @@ impl App {
         })
         .ok();
 
+        let n = tabs.len();
         Self {
             tabs,
             active: 0,
@@ -563,63 +611,166 @@ impl App {
             dark_mode,
             show_toc: true,
             tab_search: String::new(),
+            search_query: String::new(),
+            search_last_query: String::new(),
+            search_hits: vec![vec![]; n],
+            search_nav_idx: 0,
+            search_stale: false,
         }
+    }
+
+    /// Re-run sassy search across all tabs and populate `search_hits`.
+    fn rerun_search(&mut self) {
+        let query_lower: Vec<u8> = self.search_query.to_lowercase().into_bytes();
+        let k = search_k(query_lower.len());
+        self.search_hits = self.tabs.iter().map(|tab| {
+            if query_lower.is_empty() {
+                return vec![];
+            }
+            tab.toc_sections
+                .iter()
+                .enumerate()
+                .filter_map(|(i, sec)| {
+                    best_match_cost(&query_lower, &section_text(sec), k).map(|cost| (i, cost))
+                })
+                .collect()
+        }).collect();
     }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // ── Reload changed files ──────────────────────────────────────────────
         while let Ok(changed_path) = self.reload_rx.try_recv() {
             for tab in &mut self.tabs {
                 if let (Ok(a), Ok(b)) = (tab.path.canonicalize(), changed_path.canonicalize()) {
                     if a == b {
                         tab.reload();
+                        self.search_stale = true;
                     }
                 }
             }
             ctx.request_repaint();
         }
 
+        // ── Re-run search when the query changes or a tab reloads ────────────
+        let query_changed = self.search_query != self.search_last_query;
+        if query_changed || self.search_stale {
+            self.search_last_query = self.search_query.clone();
+            self.search_stale = false;
+            self.rerun_search();
+            if query_changed {
+                self.search_nav_idx = 0;
+                // Auto-scroll to first match in the active tab.
+                if let Some(&(sec, _)) = self.search_hits.get(self.active).and_then(|h| h.first()) {
+                    self.tabs[self.active].scroll_to = Some(sec);
+                }
+            }
+        }
+
+        // ── Derive per-frame search display state ─────────────────────────────
+        // Clone now to avoid borrow conflicts inside the closures below.
+        // Each entry: (section_idx, best_cost).  cost==0 → exact, cost>0 → approx.
+        let active_hits: Vec<(usize, usize)> = self
+            .search_hits
+            .get(self.active)
+            .cloned()
+            .unwrap_or_default();
+        let active_hit_section: Option<usize> = if !active_hits.is_empty()
+            && !self.search_query.is_empty()
+        {
+            Some(active_hits[self.search_nav_idx.min(active_hits.len() - 1)].0)
+        } else {
+            None
+        };
+        let matching_tab_count = self.search_hits.iter().filter(|h| !h.is_empty()).count();
+
+        // ── Visuals ───────────────────────────────────────────────────────────
         if self.dark_mode {
             ctx.set_visuals(egui::Visuals::dark());
         } else {
             ctx.set_visuals(egui::Visuals::light());
         }
 
+        // Ctrl+F focuses the search box.
+        let search_box_id = egui::Id::new("content_search_box");
+        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F)) {
+            ctx.memory_mut(|m| m.request_focus(search_box_id));
+        }
+
+        // ── Top panel ─────────────────────────────────────────────────────────
+        let mut scroll_to_request: Option<usize> = None;
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                // ── File dropdown ──────────────────────────────────────────────
                 let current_name = self.tabs[self.active].display_name().to_owned();
                 let btn = ui.button(format!("▾  {current_name}"));
                 let popup_id = egui::Popup::default_response_id(&btn);
-                let tab_search = &mut self.tab_search;
-                let tabs = &self.tabs;
-                let active = &mut self.active;
-                egui::Popup::from_toggle_button_response(&btn)
-                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                    .layout(egui::Layout::top_down_justified(egui::Align::LEFT))
-                    .show(|ui| {
-                        ui.set_min_width(320.0);
-                        ui.add(
-                            egui::TextEdit::singleline(tab_search)
-                                .hint_text("Search…")
-                                .desired_width(f32::INFINITY),
-                        );
-                        ui.separator();
-                        let search = tab_search.to_lowercase();
-                        egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
-                            for i in 0..tabs.len() {
-                                let name = tabs[i].display_name().to_owned();
-                                if search.is_empty() || name.to_lowercase().contains(&search) {
-                                    if ui.selectable_value(active, i, &name).clicked() {
-                                        egui::Popup::close_id(ui.ctx(), popup_id);
-                                        tab_search.clear();
+                {
+                    let tab_search = &mut self.tab_search;
+                    let tabs = &self.tabs;
+                    let active = &mut self.active;
+                    let search_hits = &self.search_hits;
+                    let has_content_query = !self.search_query.is_empty();
+                    egui::Popup::from_toggle_button_response(&btn)
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .layout(egui::Layout::top_down_justified(egui::Align::LEFT))
+                        .show(|ui| {
+                            ui.set_min_width(320.0);
+                            ui.add(
+                                egui::TextEdit::singleline(tab_search)
+                                    .hint_text("Search files…")
+                                    .desired_width(f32::INFINITY),
+                            );
+                            ui.separator();
+                            let filter = tab_search.to_lowercase();
+                            egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                                for i in 0..tabs.len() {
+                                    let name = tabs[i].display_name().to_owned();
+                                    if filter.is_empty()
+                                        || name.to_lowercase().contains(&filter)
+                                    {
+                                        // Show exact + approx section counts next to the name.
+                                        let label = if has_content_query {
+                                            let hits = search_hits.get(i).map(|h| h.as_slice()).unwrap_or(&[]);
+                                            let exact = hits.iter().filter(|(_, c)| *c == 0).count();
+                                            let approx = hits.iter().filter(|(_, c)| *c > 0).count();
+                                            match (exact, approx) {
+                                                (0, 0) => name,
+                                                (e, 0) => format!("{name}  ({e})"),
+                                                (0, a) => format!("{name}  (~{a})"),
+                                                (e, a) => format!("{name}  ({e}+~{a})"),
+                                            }
+                                        } else {
+                                            name
+                                        };
+                                        if ui.selectable_value(active, i, label).clicked() {
+                                            egui::Popup::close_id(ui.ctx(), popup_id);
+                                            tab_search.clear();
+                                        }
                                     }
                                 }
-                            }
+                            });
                         });
-                    });
+                }
 
+                // ── Content search bar ─────────────────────────────────────────
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.search_query)
+                        .id(search_box_id)
+                        .hint_text("🔍  Search…")
+                        .desired_width(200.0),
+                );
+                // Escape clears the query when the search box is focused.
+                if ctx.memory(|m| m.has_focus(search_box_id))
+                    && ui.input(|i| i.key_pressed(egui::Key::Escape))
+                {
+                    self.search_query.clear();
+                }
+
+                // ── Navigation + right-side controls ──────────────────────────
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Theme toggle and TOC toggle (rightmost items).
                     let icon = if self.dark_mode { "☀" } else { "🌙" };
                     if ui.button(icon).clicked() {
                         self.dark_mode = !self.dark_mode;
@@ -633,11 +784,50 @@ impl eframe::App for App {
                         ui.toggle_value(&mut self.show_toc, toc_icon)
                             .on_hover_text("Toggle table of contents");
                     }
+
+                    if !self.search_query.is_empty() {
+                        if !active_hits.is_empty() {
+                            if ui.small_button("▼").clicked() {
+                                self.search_nav_idx =
+                                    (self.search_nav_idx + 1) % active_hits.len();
+                                scroll_to_request = Some(active_hits[self.search_nav_idx].0);
+                            }
+                            if ui.small_button("▲").clicked() {
+                                self.search_nav_idx = if self.search_nav_idx == 0 {
+                                    active_hits.len() - 1
+                                } else {
+                                    self.search_nav_idx - 1
+                                };
+                                scroll_to_request = Some(active_hits[self.search_nav_idx].0);
+                            }
+                            let nav = self.search_nav_idx.min(active_hits.len() - 1) + 1;
+                            let exact = active_hits.iter().filter(|(_, c)| *c == 0).count();
+                            let approx = active_hits.iter().filter(|(_, c)| *c > 0).count();
+                            let counts = match (exact, approx) {
+                                (e, 0) => format!("{e} exact"),
+                                (0, a) => format!("~{a} approx"),
+                                (e, a) => format!("{e} exact + ~{a} approx"),
+                            };
+                            let info = if matching_tab_count > 1 {
+                                format!("{nav}/{} · {counts} · {matching_tab_count} files", active_hits.len())
+                            } else {
+                                format!("{nav}/{} · {counts}", active_hits.len())
+                            };
+                            ui.small(&info);
+                        } else {
+                            ui.small("no matches");
+                        }
+                    }
                 });
             });
         });
 
-        // TOC sidebar — only shown when the active tab has heading sections and show_toc is on
+        // Apply any navigation scroll (after the panel, before the central panel runs).
+        if let Some(sec) = scroll_to_request {
+            self.tabs[self.active].scroll_to = Some(sec);
+        }
+
+        // ── TOC sidebar ───────────────────────────────────────────────────────
         let has_toc = self.tabs[self.active]
             .toc_sections
             .iter()
@@ -654,25 +844,50 @@ impl eframe::App for App {
                     ui.separator();
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         let tab = &self.tabs[self.active];
+                        let dark = ui.visuals().dark_mode;
                         for (i, section) in tab.toc_sections.iter().enumerate() {
                             if section.level == 0 {
                                 continue;
                             }
                             let indent = (section.level - 1) as f32 * 14.0;
+                            let is_active_hit = active_hit_section == Some(i);
+                            let hit_cost = active_hits.iter().find(|(idx, _)| *idx == i).map(|(_, c)| *c);
                             ui.horizontal(|ui| {
                                 ui.add_space(indent);
-                                let link_color = if ui.visuals().dark_mode {
-                                    ui.visuals().hyperlink_color
-                                } else {
-                                    egui::Color32::from_rgb(70, 110, 160)
+                                let text_color = match hit_cost {
+                                    Some(0) if is_active_hit => if dark {
+                                        egui::Color32::from_rgb(255, 160, 50)   // bright orange
+                                    } else {
+                                        egui::Color32::from_rgb(200, 80, 0)
+                                    },
+                                    Some(0) => if dark {
+                                        egui::Color32::from_rgb(200, 160, 60)   // amber
+                                    } else {
+                                        egui::Color32::from_rgb(150, 100, 0)
+                                    },
+                                    Some(_) if is_active_hit => if dark {
+                                        egui::Color32::from_rgb(110, 180, 255)  // bright blue
+                                    } else {
+                                        egui::Color32::from_rgb(30, 100, 200)
+                                    },
+                                    Some(_) => if dark {
+                                        egui::Color32::from_rgb(80, 140, 210)   // muted blue
+                                    } else {
+                                        egui::Color32::from_rgb(60, 110, 185)
+                                    },
+                                    None => if dark {
+                                        ui.visuals().hyperlink_color
+                                    } else {
+                                        egui::Color32::from_rgb(70, 110, 160)
+                                    },
                                 };
-                                let label = egui::Label::new(
-                                    egui::RichText::new(&section.heading)
-                                        .small()
-                                        .color(link_color),
-                                )
-                                .sense(egui::Sense::click())
-                                .truncate();
+                                let base = egui::RichText::new(&section.heading)
+                                    .small()
+                                    .color(text_color);
+                                let rich = if is_active_hit { base.strong() } else { base };
+                                let label = egui::Label::new(rich)
+                                    .sense(egui::Sense::click())
+                                    .truncate();
                                 let response = ui
                                     .add(label)
                                     .on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -688,17 +903,50 @@ impl eframe::App for App {
             }
         }
 
+        // ── Central panel ─────────────────────────────────────────────────────
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink([false; 2])
                 .show(ui, |ui| {
                     let tab = &mut self.tabs[self.active];
                     let scroll_to = tab.scroll_to.take();
+                    let dark = ui.visuals().dark_mode;
                     for (i, section) in tab.toc_sections.iter().enumerate() {
                         if scroll_to == Some(i) {
                             ui.scroll_to_cursor(Some(egui::Align::TOP));
                         }
-                        render_segments(ui, &mut tab.cache, &section.segments);
+                        let is_active_hit = active_hit_section == Some(i);
+                        let hit_cost = active_hits.iter().find(|(idx, _)| *idx == i).map(|(_, c)| *c);
+                        if let Some(cost) = hit_cost {
+                            let exact = cost == 0;
+                            // Fill: orange tones for exact, blue tones for approx.
+                            let fill = match (exact, is_active_hit, dark) {
+                                (true,  true,  true)  => egui::Color32::from_rgba_unmultiplied(255, 140,   0, 30),
+                                (true,  true,  false) => egui::Color32::from_rgba_unmultiplied(255, 140,   0, 25),
+                                (true,  false, true)  => egui::Color32::from_rgba_unmultiplied(255, 220,   0, 12),
+                                (true,  false, false) => egui::Color32::from_rgba_unmultiplied(255, 220,   0, 20),
+                                (false, true,  true)  => egui::Color32::from_rgba_unmultiplied( 80, 150, 255, 30),
+                                (false, true,  false) => egui::Color32::from_rgba_unmultiplied( 80, 130, 255, 22),
+                                (false, false, true)  => egui::Color32::from_rgba_unmultiplied( 80, 150, 255, 12),
+                                (false, false, false) => egui::Color32::from_rgba_unmultiplied( 80, 130, 255, 18),
+                            };
+                            let stroke_color = match (exact, is_active_hit) {
+                                (true,  true)  => egui::Color32::from_rgb(220, 120,   0),
+                                (true,  false) => egui::Color32::from_rgba_unmultiplied(200, 160,   0, 120),
+                                (false, true)  => egui::Color32::from_rgb( 70, 130, 220),
+                                (false, false) => egui::Color32::from_rgba_unmultiplied( 70, 130, 220, 110),
+                            };
+                            egui::Frame::new()
+                                .fill(fill)
+                                .stroke(egui::Stroke::new(1.5, stroke_color))
+                                .inner_margin(egui::Margin::same(6))
+                                .corner_radius(egui::CornerRadius::same(4))
+                                .show(ui, |ui| {
+                                    render_segments(ui, &mut tab.cache, &section.segments);
+                                });
+                        } else {
+                            render_segments(ui, &mut tab.cache, &section.segments);
+                        }
                     }
                 });
         });
