@@ -17,3 +17,4 @@ serde_json = "1"
 rfd = "0.15"
 ureq = "2"
 sassy = { version = "0.2.1", default-features = false, features = ["scalar"] }
+toml = "0.8"

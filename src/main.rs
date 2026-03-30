@@ -14,6 +14,124 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use sassy::{Searcher, profiles::Ascii};
 use serde::Deserialize;
 
+// ── Config ────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, Default)]
+struct Config {
+    /// Preferred colour theme. `true` = dark, `false` = light.
+    /// Absent → light (egui default).
+    dark_mode: Option<bool>,
+}
+
+fn load_config() -> Config {
+    let path = std::env::var("HOME")
+        .map(|home| {
+            PathBuf::from(home)
+                .join(".config")
+                .join("markdown-eye")
+                .join("config.toml")
+        })
+        .unwrap_or_default();
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| toml::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+// ── Bookmarks ─────────────────────────────────────────────────────────────────
+
+struct BookmarkItem {
+    title: String,
+    target: String, // absolute file path or URL
+    summary: String,
+}
+
+fn bookmark_file_path() -> PathBuf {
+    std::env::var("HOME")
+        .map(|home| {
+            PathBuf::from(home)
+                .join(".config")
+                .join("markdown-eye")
+                .join("bookmarks.md")
+        })
+        .unwrap_or_default()
+}
+
+/// Parse a heading line like `## [Title](target)` into `(title, target)`.
+fn parse_bookmark_heading(line: &str) -> Option<(String, String)> {
+    let rest = line.strip_prefix("## [")?;
+    let bracket_end = rest.find("](")?;
+    let title = rest[..bracket_end].to_string();
+    let after = &rest[bracket_end + 2..];
+    let paren_end = after.rfind(')')?;
+    let target = after[..paren_end].to_string();
+    Some((title, target))
+}
+
+fn load_bookmarks(path: &PathBuf) -> Vec<BookmarkItem> {
+    let content = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let mut items: Vec<BookmarkItem> = Vec::new();
+    // (title, target, accumulated summary lines)
+    let mut current: Option<(String, String, Vec<String>)> = None;
+    for line in content.lines() {
+        if let Some((title, target)) = parse_bookmark_heading(line) {
+            if let Some((t, tg, summary_lines)) = current.take() {
+                items.push(BookmarkItem {
+                    title: t,
+                    target: tg,
+                    summary: summary_lines.join("\n").trim().to_string(),
+                });
+            }
+            current = Some((title, target, Vec::new()));
+        } else if let Some((_, _, ref mut lines)) = current {
+            lines.push(line.to_string());
+        }
+    }
+    if let Some((t, tg, summary_lines)) = current {
+        items.push(BookmarkItem {
+            title: t,
+            target: tg,
+            summary: summary_lines.join("\n").trim().to_string(),
+        });
+    }
+    items
+}
+
+fn save_bookmarks(path: &PathBuf, items: &[BookmarkItem]) {
+    let mut out = String::from("# markdown-eye bookmarks\n");
+    for item in items {
+        out.push('\n');
+        out.push_str(&format!("## [{}]({})\n", item.title, item.target));
+        if !item.summary.is_empty() {
+            out.push('\n');
+            out.push_str(&item.summary);
+            if !item.summary.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+    }
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, out);
+}
+
+/// Canonical string key for a tab: URL as-is, file path canonicalised (or raw).
+fn tab_target(tab: &FileTab) -> String {
+    if let Some(url) = &tab.url {
+        url.clone()
+    } else {
+        tab.path
+            .canonicalize()
+            .unwrap_or_else(|_| tab.path.clone())
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
 // ── Table extraction & copy helpers ───────────────────────────────────────────
 
 struct TocSection {
@@ -303,6 +421,7 @@ impl FormApp {
         markdown_content: String,
         schema: FormSchema,
         result: Arc<Mutex<Option<String>>>,
+        dark_mode: bool,
     ) -> Self {
         let states = schema
             .fields
@@ -320,7 +439,7 @@ impl FormApp {
             cache: CommonMarkCache::default(),
             fields: schema.fields,
             states,
-            dark_mode: false,
+            dark_mode,
             result,
         }
     }
@@ -488,6 +607,9 @@ struct FileTab {
     cache: CommonMarkCache,
     toc_sections: Vec<TocSection>,
     scroll_to: Option<usize>,
+    from_stdin: bool,
+    is_bookmark: bool,
+    bookmark_title: Option<String>,
 }
 
 impl FileTab {
@@ -502,6 +624,9 @@ impl FileTab {
             cache: CommonMarkCache::default(),
             toc_sections,
             scroll_to: None,
+            from_stdin: false,
+            is_bookmark: false,
+            bookmark_title: None,
         })
     }
 
@@ -519,6 +644,9 @@ impl FileTab {
             cache: CommonMarkCache::default(),
             toc_sections,
             scroll_to: None,
+            from_stdin: false,
+            is_bookmark: false,
+            bookmark_title: None,
         })
     }
 
@@ -535,6 +663,9 @@ impl FileTab {
     }
 
     fn display_name(&self) -> &str {
+        if let Some(title) = &self.bookmark_title {
+            return title.as_str();
+        }
         if let Some(url) = &self.url {
             url.trim_end_matches('/')
                 .rsplit('/')
@@ -568,15 +699,44 @@ struct App {
     search_nav_idx: usize,
     /// Set when a tab reloads so search results are rebuilt next frame.
     search_stale: bool,
+    bookmarks: Vec<BookmarkItem>,
+    bookmark_path: PathBuf,
 }
 
 impl App {
-    fn new(tabs: Vec<FileTab>, dark_mode: bool) -> Self {
+    fn new(
+        session_tabs: Vec<FileTab>,
+        dark_mode: bool,
+        bookmarks: Vec<BookmarkItem>,
+        bookmark_path: PathBuf,
+    ) -> Self {
+        // Load bookmark tabs (silently skip ones that fail to load).
+        let bookmark_tabs: Vec<FileTab> = bookmarks
+            .iter()
+            .filter_map(|item| {
+                let result = if item.target.starts_with("http://")
+                    || item.target.starts_with("https://")
+                {
+                    FileTab::load_url(item.target.clone()).ok()
+                } else {
+                    FileTab::load(PathBuf::from(&item.target)).ok()
+                };
+                result.map(|mut t| {
+                    t.is_bookmark = true;
+                    t.bookmark_title = Some(item.title.clone());
+                    t
+                })
+            })
+            .collect();
+
+        let mut tabs = session_tabs;
+        tabs.extend(bookmark_tabs);
+
         let (tx, rx) = mpsc::channel::<PathBuf>();
 
         let watched_paths: Vec<PathBuf> = tabs
             .iter()
-            .filter(|t| t.url.is_none())
+            .filter(|t| t.url.is_none() && !t.from_stdin)
             .map(|t| t.path.clone())
             .collect();
 
@@ -616,6 +776,8 @@ impl App {
             search_hits: vec![vec![]; n],
             search_nav_idx: 0,
             search_stale: false,
+            bookmarks,
+            bookmark_path,
         }
     }
 
@@ -700,6 +862,7 @@ impl eframe::App for App {
 
         // ── Top panel ─────────────────────────────────────────────────────────
         let mut scroll_to_request: Option<usize> = None;
+        let mut toggle_bookmark = false;
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 // ── File dropdown ──────────────────────────────────────────────
@@ -725,29 +888,37 @@ impl eframe::App for App {
                             ui.separator();
                             let filter = tab_search.to_lowercase();
                             egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                                let mut shown_bookmark_section = false;
                                 for i in 0..tabs.len() {
                                     let name = tabs[i].display_name().to_owned();
-                                    if filter.is_empty()
-                                        || name.to_lowercase().contains(&filter)
+                                    if !filter.is_empty()
+                                        && !name.to_lowercase().contains(&filter)
                                     {
-                                        // Show exact + approx section counts next to the name.
-                                        let label = if has_content_query {
-                                            let hits = search_hits.get(i).map(|h| h.as_slice()).unwrap_or(&[]);
-                                            let exact = hits.iter().filter(|(_, c)| *c == 0).count();
-                                            let approx = hits.iter().filter(|(_, c)| *c > 0).count();
-                                            match (exact, approx) {
-                                                (0, 0) => name,
-                                                (e, 0) => format!("{name}  ({e})"),
-                                                (0, a) => format!("{name}  (~{a})"),
-                                                (e, a) => format!("{name}  ({e}+~{a})"),
-                                            }
-                                        } else {
-                                            name
-                                        };
-                                        if ui.selectable_value(active, i, label).clicked() {
-                                            egui::Popup::close_id(ui.ctx(), popup_id);
-                                            tab_search.clear();
+                                        continue;
+                                    }
+                                    // Insert section header before the first visible bookmark tab.
+                                    if tabs[i].is_bookmark && !shown_bookmark_section {
+                                        ui.separator();
+                                        ui.small("Bookmarks");
+                                        shown_bookmark_section = true;
+                                    }
+                                    // Show exact + approx section counts next to the name.
+                                    let label = if has_content_query {
+                                        let hits = search_hits.get(i).map(|h| h.as_slice()).unwrap_or(&[]);
+                                        let exact = hits.iter().filter(|(_, c)| *c == 0).count();
+                                        let approx = hits.iter().filter(|(_, c)| *c > 0).count();
+                                        match (exact, approx) {
+                                            (0, 0) => name,
+                                            (e, 0) => format!("{name}  ({e})"),
+                                            (0, a) => format!("{name}  (~{a})"),
+                                            (e, a) => format!("{name}  ({e}+~{a})"),
                                         }
+                                    } else {
+                                        name
+                                    };
+                                    if ui.selectable_value(active, i, label).clicked() {
+                                        egui::Popup::close_id(ui.ctx(), popup_id);
+                                        tab_search.clear();
                                     }
                                 }
                             });
@@ -783,6 +954,17 @@ impl eframe::App for App {
                         let toc_icon = if self.show_toc { "≡·" } else { "≡" };
                         ui.toggle_value(&mut self.show_toc, toc_icon)
                             .on_hover_text("Toggle table of contents");
+                    }
+
+                    // Bookmark toggle (hidden for stdin).
+                    if !self.tabs[self.active].from_stdin {
+                        let target = tab_target(&self.tabs[self.active]);
+                        let is_bm = self.bookmarks.iter().any(|b| b.target == target);
+                        let bm_icon = if is_bm { "★" } else { "☆" };
+                        let bm_tip = if is_bm { "Remove bookmark" } else { "Add bookmark" };
+                        if ui.button(bm_icon).on_hover_text(bm_tip).clicked() {
+                            toggle_bookmark = true;
+                        }
                     }
 
                     if !self.search_query.is_empty() {
@@ -825,6 +1007,58 @@ impl eframe::App for App {
         // Apply any navigation scroll (after the panel, before the central panel runs).
         if let Some(sec) = scroll_to_request {
             self.tabs[self.active].scroll_to = Some(sec);
+        }
+
+        // ── Bookmark toggle ───────────────────────────────────────────────────
+        if toggle_bookmark {
+            let target = tab_target(&self.tabs[self.active]);
+            let title = self.tabs[self.active].display_name().to_owned();
+            let bm_idx = self.bookmarks.iter().position(|b| b.target == target);
+            let bm_path = self.bookmark_path.clone();
+            if let Some(idx) = bm_idx {
+                // Remove the bookmark entry.
+                self.bookmarks.remove(idx);
+                save_bookmarks(&bm_path, &self.bookmarks);
+                // Remove the associated bookmark tab (active if it is one, else find it).
+                let tab_to_remove = if self.tabs[self.active].is_bookmark {
+                    Some(self.active)
+                } else {
+                    self.tabs.iter().position(|t| t.is_bookmark && tab_target(t) == target)
+                };
+                if let Some(ti) = tab_to_remove {
+                    self.tabs.remove(ti);
+                    self.search_hits.remove(ti);
+                    if self.active > ti {
+                        self.active -= 1;
+                    } else if self.active >= self.tabs.len() {
+                        self.active = self.tabs.len().saturating_sub(1);
+                    }
+                }
+            } else {
+                // Add the bookmark entry.
+                self.bookmarks.push(BookmarkItem {
+                    title: title.clone(),
+                    target: target.clone(),
+                    summary: String::new(),
+                });
+                save_bookmarks(&bm_path, &self.bookmarks);
+                // Add a bookmark tab if this target isn't already one.
+                let already = self.tabs.iter().any(|t| t.is_bookmark && tab_target(t) == target);
+                if !already {
+                    let new_tab = if target.starts_with("http://") || target.starts_with("https://") {
+                        FileTab::load_url(target).ok()
+                    } else {
+                        FileTab::load(PathBuf::from(&target)).ok()
+                    };
+                    if let Some(mut t) = new_tab {
+                        t.is_bookmark = true;
+                        t.bookmark_title = Some(title);
+                        self.tabs.push(t);
+                        self.search_hits.push(vec![]);
+                        self.search_stale = true;
+                    }
+                }
+            }
         }
 
         // ── TOC sidebar ───────────────────────────────────────────────────────
@@ -1010,7 +1244,13 @@ fn window_dims(portrait: bool) -> (f32, f32) {
     if portrait { (800.0, 1100.0) } else { (1200.0, 800.0) }
 }
 
-fn launch(tabs: Vec<FileTab>, portrait: bool) {
+fn launch(
+    tabs: Vec<FileTab>,
+    portrait: bool,
+    dark_mode: bool,
+    bookmarks: Vec<BookmarkItem>,
+    bookmark_path: PathBuf,
+) {
     let (width, height) = window_dims(portrait);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -1021,7 +1261,7 @@ fn launch(tabs: Vec<FileTab>, portrait: bool) {
     eframe::run_native(
         "markdown-eye",
         options,
-        Box::new(|_cc| Ok(Box::new(App::new(tabs, false)))),
+        Box::new(move |_cc| Ok(Box::new(App::new(tabs, dark_mode, bookmarks, bookmark_path)))),
     )
     .unwrap();
 }
@@ -1127,6 +1367,10 @@ fn main() {
     };
 
     let cli = Cli::parse_from(effective);
+    let config = load_config();
+    let dark_mode = config.dark_mode.unwrap_or(false);
+    let bookmark_path = bookmark_file_path();
+    let bookmarks = load_bookmarks(&bookmark_path);
 
     match cli.command {
         Commands::Describe => {
@@ -1203,8 +1447,8 @@ fn main() {
                 eframe::run_native(
                     "markdown-eye",
                     options,
-                    Box::new(|_cc| {
-                        Ok(Box::new(FormApp::new(markdown, schema, result_clone)))
+                    Box::new(move |_cc| {
+                        Ok(Box::new(FormApp::new(markdown, schema, result_clone, dark_mode)))
                     }),
                 )
                 .unwrap();
@@ -1223,8 +1467,11 @@ fn main() {
                     cache: CommonMarkCache::default(),
                     toc_sections,
                     scroll_to: None,
+                    from_stdin: true,
+                    is_bookmark: false,
+                    bookmark_title: None,
                 };
-                launch(vec![tab], portrait);
+                launch(vec![tab], portrait, dark_mode, bookmarks, bookmark_path);
             }
         }
 
@@ -1272,7 +1519,7 @@ fn main() {
                 std::process::exit(1);
             }
 
-            launch(tabs, portrait);
+            launch(tabs, portrait, dark_mode, bookmarks, bookmark_path);
         }
     }
 }
