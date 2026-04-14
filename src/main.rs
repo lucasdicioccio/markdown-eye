@@ -1389,7 +1389,7 @@ fn main() {
     }},
     {{
       "name": "mode",
-      "description": "Operating mode. 'view': render markdown only, form blocks are ignored. 'form': show the interactive form defined in the ```form block. 'echo-instructions': print the form-authoring guide to stdout and exit — content is NOT read from stdin and the content argument is ignored entirely.",
+      "description": "Operating mode. 'view': render markdown only, form blocks are ignored. 'form': show the interactive form defined in the ```form block — REQUIRED: the content MUST contain a valid ```form JSON block or the process exits with code 1; only use this mode when the content argument includes such a block. 'echo-instructions': print the form-authoring guide to stdout and exit — content is NOT read from stdin and the content argument is ignored entirely.",
       "type": "string",
       "backing_type": "string",
       "arity": "optional",
@@ -1423,7 +1423,14 @@ fn main() {
                 _ => {
                     // Auto-detect: use form mode only if a valid form block is present.
                     let (schema, _) = extract_form_schema(&content);
-                    schema.is_some()
+                    let found = schema.is_some();
+                    if !found {
+                        eprintln!("warning: no ```form block detected in input — rendering as plain markdown.");
+                        eprintln!("         Run with --mode echo-instructions to see how to author a form.");
+                        eprintln!();
+                        print_form_instructions();
+                    }
+                    found
                 }
             };
 
