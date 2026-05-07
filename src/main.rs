@@ -414,6 +414,8 @@ struct FormApp {
     states: Vec<FieldState>,
     dark_mode: bool,
     result: Arc<Mutex<Option<String>>>,
+    show_extra_comment: bool,
+    extra_comment: String,
 }
 
 impl FormApp {
@@ -441,6 +443,8 @@ impl FormApp {
             states,
             dark_mode,
             result,
+            show_extra_comment: false,
+            extra_comment: String::new(),
         }
     }
 
@@ -458,6 +462,12 @@ impl FormApp {
                 }
             };
             map.insert(field.name.clone(), value);
+        }
+        if self.show_extra_comment {
+            map.insert(
+                "extra.user-comment".to_string(),
+                serde_json::Value::String(self.extra_comment.clone()),
+            );
         }
         serde_json::to_string(&serde_json::Value::Object(map)).unwrap()
     }
@@ -568,6 +578,20 @@ impl eframe::App for FormApp {
                         }
 
                         ui.add_space(6.0);
+                    }
+
+                    ui.separator();
+                    ui.add_space(4.0);
+
+                    ui.checkbox(&mut self.show_extra_comment, "Add comment");
+                    if self.show_extra_comment {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.extra_comment)
+                                .desired_rows(3)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("Optional comment…"),
+                        );
+                        ui.add_space(4.0);
                     }
 
                     ui.separator();
@@ -701,6 +725,9 @@ struct App {
     search_stale: bool,
     bookmarks: Vec<BookmarkItem>,
     bookmark_path: PathBuf,
+    show_extra_comment: bool,
+    extra_comment: String,
+    result: Arc<Mutex<Option<String>>>,
 }
 
 impl App {
@@ -709,6 +736,7 @@ impl App {
         dark_mode: bool,
         bookmarks: Vec<BookmarkItem>,
         bookmark_path: PathBuf,
+        result: Arc<Mutex<Option<String>>>,
     ) -> Self {
         // Load bookmark tabs (silently skip ones that fail to load).
         let bookmark_tabs: Vec<FileTab> = bookmarks
@@ -778,6 +806,9 @@ impl App {
             search_stale: false,
             bookmarks,
             bookmark_path,
+            show_extra_comment: false,
+            extra_comment: String::new(),
+            result,
         }
     }
 
@@ -946,6 +977,8 @@ impl eframe::App for App {
                     if ui.button(icon).clicked() {
                         self.dark_mode = !self.dark_mode;
                     }
+                    ui.toggle_value(&mut self.show_extra_comment, "✎")
+                        .on_hover_text("Add a comment");
                     let has_toc = self.tabs[self.active]
                         .toc_sections
                         .iter()
@@ -1059,6 +1092,31 @@ impl eframe::App for App {
                     }
                 }
             }
+        }
+
+        // ── Extra comment panel ───────────────────────────────────────────────
+        if self.show_extra_comment {
+            egui::TopBottomPanel::bottom("comment_panel")
+                .resizable(true)
+                .min_height(80.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong("Comment");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Submit comment").clicked() {
+                                *self.result.lock().unwrap() =
+                                    Some(self.extra_comment.clone());
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                        });
+                    });
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.extra_comment)
+                            .desired_rows(3)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("Optional comment…"),
+                    );
+                });
         }
 
         // ── TOC sidebar ───────────────────────────────────────────────────────
@@ -1250,7 +1308,9 @@ fn launch(
     dark_mode: bool,
     bookmarks: Vec<BookmarkItem>,
     bookmark_path: PathBuf,
-) {
+) -> Option<String> {
+    let result: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let result_clone = result.clone();
     let (width, height) = window_dims(portrait);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -1261,9 +1321,13 @@ fn launch(
     eframe::run_native(
         "markdown-eye",
         options,
-        Box::new(move |_cc| Ok(Box::new(App::new(tabs, dark_mode, bookmarks, bookmark_path)))),
+        Box::new(move |_cc| {
+            Ok(Box::new(App::new(tabs, dark_mode, bookmarks, bookmark_path, result_clone)))
+        }),
     )
     .unwrap();
+    let comment = result.lock().unwrap().take();
+    comment
 }
 
 fn print_form_instructions() {
@@ -1478,7 +1542,9 @@ fn main() {
                     is_bookmark: false,
                     bookmark_title: None,
                 };
-                launch(vec![tab], portrait, dark_mode, bookmarks, bookmark_path);
+                if let Some(comment) = launch(vec![tab], portrait, dark_mode, bookmarks, bookmark_path) {
+                    print!("{comment}");
+                }
             }
         }
 
@@ -1526,7 +1592,9 @@ fn main() {
                 std::process::exit(1);
             }
 
-            launch(tabs, portrait, dark_mode, bookmarks, bookmark_path);
+            if let Some(comment) = launch(tabs, portrait, dark_mode, bookmarks, bookmark_path) {
+                print!("{comment}");
+            }
         }
     }
 }
