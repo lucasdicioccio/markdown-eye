@@ -105,7 +105,7 @@ When a [content search](#search) is active, each file in the list shows a match 
 
 ### Table of contents
 
-Documents with `#`, `##`, or `###` headings get a collapsible TOC sidebar. Click any entry to scroll there. Toggle it with the **≡** button (top-right, only shown when the document has headings).
+Documents with `#`, `##`, or `###` headings get a collapsible TOC sidebar. Click any entry to scroll there. Toggle it with the **☰** button (top-right, only shown when the document has headings).
 
 Matching sections are colour-coded when a search is active — see [Search highlighting](#highlighting).
 
@@ -231,6 +231,33 @@ Please review the changes before proceeding.
 }
 ```
 ````
+
+---
+
+## Configuration
+
+`markdown-eye` reads an optional TOML config file at:
+
+```
+~/.config/markdown-eye/config.toml
+```
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `dark_mode` | bool | `false` | Start in dark theme |
+| `text_font` | string | *(none)* | Path to a TTF/OTF font used as the **primary** text font for all rendered content |
+| `icon_font` | string | *(none)* | Path to a TTF/OTF font used as a **fallback** for toolbar icons (☆ ☰ ☀ ☽ 🔍) |
+
+egui's built-in font covers most Latin text but lacks many Unicode symbols and all emoji. If toolbar icons appear as boxes, point `icon_font` at a symbol font on your system. `text_font` replaces the default font for all prose, headings, and UI text.
+
+```toml
+# ~/.config/markdown-eye/config.toml
+dark_mode = true
+text_font  = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+icon_font  = "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf"
+```
+
+`text_font` is inserted first in the font stack; `icon_font` is appended at the end. Color emoji fonts (e.g. `NotoColorEmoji`) are not supported by egui; use a regular TTF instead.
 
 ---
 

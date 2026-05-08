@@ -21,6 +21,48 @@ struct Config {
     /// Preferred colour theme. `true` = dark, `false` = light.
     /// Absent → light (egui default).
     dark_mode: Option<bool>,
+    /// Path to a TTF/OTF font file used as the primary text font.
+    text_font: Option<String>,
+    /// Path to a TTF/OTF font file used as a fallback for icons and symbols.
+    /// Example: "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf"
+    icon_font: Option<String>,
+}
+
+fn setup_fonts(ctx: &egui::Context, config: &Config) {
+    let mut fonts = egui::FontDefinitions::default();
+    if let Some(path) = &config.text_font {
+        match std::fs::read(path) {
+            Ok(data) => {
+                fonts
+                    .font_data
+                    .insert("text_font".to_owned(), egui::FontData::from_owned(data).into());
+                fonts
+                    .families
+                    .entry(egui::FontFamily::Proportional)
+                    .or_default()
+                    .insert(0, "text_font".to_owned());
+            }
+            Err(e) => eprintln!("warning: could not load text_font '{path}': {e}"),
+        }
+    }
+    if let Some(path) = &config.icon_font {
+        match std::fs::read(path) {
+            Ok(data) => {
+                fonts
+                    .font_data
+                    .insert("icon_font".to_owned(), egui::FontData::from_owned(data).into());
+                fonts
+                    .families
+                    .entry(egui::FontFamily::Proportional)
+                    .or_default()
+                    .push("icon_font".to_owned());
+            }
+            Err(e) => eprintln!("warning: could not load icon_font '{path}': {e}"),
+        }
+    }
+    if config.text_font.is_some() || config.icon_font.is_some() {
+        ctx.set_fonts(fonts);
+    }
 }
 
 fn load_config() -> Config {
@@ -984,7 +1026,7 @@ impl eframe::App for App {
                         .iter()
                         .any(|s| s.level > 0);
                     if has_toc {
-                        let toc_icon = if self.show_toc { "≡·" } else { "≡" };
+                        let toc_icon = if self.show_toc { "☰·" } else { "☰" };
                         ui.toggle_value(&mut self.show_toc, toc_icon)
                             .on_hover_text("Toggle table of contents");
                     }
@@ -1308,6 +1350,7 @@ fn launch(
     dark_mode: bool,
     bookmarks: Vec<BookmarkItem>,
     bookmark_path: PathBuf,
+    config: &Config,
 ) -> Option<String> {
     let result: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let result_clone = result.clone();
@@ -1318,10 +1361,14 @@ fn launch(
             .with_inner_size([width, height]),
         ..Default::default()
     };
+    let text_font = config.text_font.clone();
+    let icon_font = config.icon_font.clone();
     eframe::run_native(
         "markdown-eye",
         options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
+            let font_config = Config { text_font: text_font.clone(), icon_font: icon_font.clone(), ..Default::default() };
+            setup_fonts(&cc.egui_ctx, &font_config);
             Ok(Box::new(App::new(tabs, dark_mode, bookmarks, bookmark_path, result_clone)))
         }),
     )
@@ -1515,10 +1562,14 @@ fn main() {
                         .with_inner_size([width, height]),
                     ..Default::default()
                 };
+                let text_font = config.text_font.clone();
+                let icon_font = config.icon_font.clone();
                 eframe::run_native(
                     "markdown-eye",
                     options,
-                    Box::new(move |_cc| {
+                    Box::new(move |cc| {
+                        let font_config = Config { text_font: text_font.clone(), icon_font: icon_font.clone(), ..Default::default() };
+                        setup_fonts(&cc.egui_ctx, &font_config);
                         Ok(Box::new(FormApp::new(markdown, schema, result_clone, dark_mode)))
                     }),
                 )
@@ -1542,7 +1593,7 @@ fn main() {
                     is_bookmark: false,
                     bookmark_title: None,
                 };
-                if let Some(comment) = launch(vec![tab], portrait, dark_mode, bookmarks, bookmark_path) {
+                if let Some(comment) = launch(vec![tab], portrait, dark_mode, bookmarks, bookmark_path, &config) {
                     print!("{comment}");
                 }
             }
@@ -1592,7 +1643,7 @@ fn main() {
                 std::process::exit(1);
             }
 
-            if let Some(comment) = launch(tabs, portrait, dark_mode, bookmarks, bookmark_path) {
+            if let Some(comment) = launch(tabs, portrait, dark_mode, bookmarks, bookmark_path, &config) {
                 print!("{comment}");
             }
         }
