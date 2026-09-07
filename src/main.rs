@@ -187,8 +187,17 @@ enum Segment {
     Table {
         raw: String,
         headers: Vec<String>,
+        aligns: Vec<CellAlign>,
         rows: Vec<Vec<String>>,
     },
+}
+
+/// Column alignment, from the `:---:` markers on a table's separator row.
+#[derive(Clone, Copy, PartialEq)]
+enum CellAlign {
+    Left,
+    Center,
+    Right,
 }
 
 fn is_table_separator(line: &str) -> bool {
@@ -200,7 +209,74 @@ fn parse_table_row(line: &str) -> Vec<String> {
     let t = line.trim();
     let inner = t.strip_prefix('|').unwrap_or(t);
     let inner = inner.strip_suffix('|').unwrap_or(inner);
-    inner.split('|').map(|s| s.trim().to_string()).collect()
+
+    let mut cells = Vec::new();
+    let mut cur = String::new();
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            // `\|` is a literal pipe, not a cell boundary.
+            '\\' if chars.peek() == Some(&'|') => {
+                chars.next();
+                cur.push('|');
+            }
+            '|' => {
+                cells.push(cur.trim().to_string());
+                cur.clear();
+            }
+            _ => cur.push(c),
+        }
+    }
+    cells.push(cur.trim().to_string());
+    cells
+}
+
+fn parse_table_aligns(sep_line: &str) -> Vec<CellAlign> {
+    parse_table_row(sep_line)
+        .iter()
+        .map(|c| match (c.starts_with(':'), c.ends_with(':')) {
+            (true, true) => CellAlign::Center,
+            (false, true) => CellAlign::Right,
+            _ => CellAlign::Left,
+        })
+        .collect()
+}
+
+/// Strip inline markdown markers, for measuring how wide a cell wants to be.
+fn plain_text(md: &str) -> String {
+    let mut out = String::new();
+    let mut chars = md.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                if let Some(n) = chars.next() {
+                    out.push(n);
+                }
+            }
+            '`' | '*' | '_' | '~' | '[' => {}
+            ']' => {
+                // Drop the `(url)` half of a link, keeping its text.
+                if chars.peek() == Some(&'(') {
+                    chars.next();
+                    let mut depth = 1;
+                    for c2 in chars.by_ref() {
+                        match c2 {
+                            '(' => depth += 1,
+                            ')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 fn parse_segments(content: &str) -> Vec<Segment> {
@@ -209,8 +285,33 @@ fn parse_segments(content: &str) -> Vec<Segment> {
     let mut md_lines: Vec<&str> = Vec::new();
     let mut i = 0;
 
+    let mut fence: Option<String> = None;
+
     while i < lines.len() {
         let line = lines[i];
+
+        // Never look for tables inside a fenced code block.
+        let fence_marker = {
+            let t = line.trim_start();
+            if t.starts_with("```") {
+                Some("```")
+            } else if t.starts_with("~~~") {
+                Some("~~~")
+            } else {
+                None
+            }
+        };
+        match (&fence, fence_marker) {
+            (Some(open), Some(m)) if open == m => fence = None,
+            (None, Some(m)) => fence = Some(m.to_string()),
+            _ => {}
+        }
+        if fence.is_some() || fence_marker.is_some() {
+            md_lines.push(line);
+            i += 1;
+            continue;
+        }
+
         let is_row = line.trim().starts_with('|');
         let next_is_sep = i + 1 < lines.len() && is_table_separator(lines[i + 1]);
 
@@ -221,6 +322,7 @@ fn parse_segments(content: &str) -> Vec<Segment> {
             }
 
             let headers = parse_table_row(lines[i]);
+            let aligns = parse_table_aligns(lines[i + 1]);
             let mut raw_lines = vec![lines[i], lines[i + 1]];
             let mut rows: Vec<Vec<String>> = Vec::new();
             i += 2;
@@ -239,6 +341,7 @@ fn parse_segments(content: &str) -> Vec<Segment> {
             segments.push(Segment::Table {
                 raw: raw_lines.join("\n"),
                 headers,
+                aligns,
                 rows,
             });
         } else {
@@ -286,13 +389,245 @@ fn table_to_json(headers: &[String], rows: &[Vec<String>]) -> String {
     serde_json::to_string_pretty(&serde_json::Value::Array(arr)).unwrap()
 }
 
+/// Width a column would like: the widest cell, plus padding. Also reports the
+/// width of the longest single word, the point below which wrapping gets ugly.
+fn column_demands(
+    ui: &egui::Ui,
+    ncols: usize,
+    headers: &[String],
+    rows: &[Vec<String>],
+) -> (Vec<f32>, Vec<f32>) {
+    const CELL_PAD: f32 = 10.0;
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let measure = |s: &str| -> f32 {
+        if s.is_empty() {
+            return 0.0;
+        }
+        ui.fonts_mut(|f| {
+            f.layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::WHITE)
+                .size()
+                .x
+        })
+    };
+
+    let mut natural = vec![0.0_f32; ncols];
+    let mut floor = vec![0.0_f32; ncols];
+    let all_rows = std::iter::once(headers).chain(rows.iter().map(|r| r.as_slice()));
+    for row in all_rows {
+        for (c, cell) in row.iter().enumerate().take(ncols) {
+            let text = plain_text(cell);
+            natural[c] = natural[c].max(measure(&text) + CELL_PAD);
+            let word = text
+                .split_whitespace()
+                .map(measure)
+                .fold(0.0_f32, f32::max);
+            floor[c] = floor[c].max(word + CELL_PAD);
+        }
+    }
+    (natural, floor)
+}
+
+/// Fit the columns into `avail`. Columns that already fit in an equal share keep
+/// their natural width; the greedy ones split what is left in proportion to what
+/// they asked for. Then columns squeezed below their longest word claw back
+/// space from the columns that still have slack.
+fn fit_columns(natural: &[f32], floor: &[f32], avail: f32) -> Vec<f32> {
+    let total: f32 = natural.iter().sum();
+    if total <= avail {
+        return natural.to_vec();
+    }
+
+    let mut widths = vec![0.0_f32; natural.len()];
+    let mut pending: Vec<usize> = (0..natural.len()).collect();
+    let mut left = avail;
+    loop {
+        let share = left / pending.len() as f32;
+        let small: Vec<usize> = pending
+            .iter()
+            .copied()
+            .filter(|&i| natural[i] <= share)
+            .collect();
+        if small.is_empty() {
+            break;
+        }
+        for i in small {
+            widths[i] = natural[i];
+            left -= natural[i];
+            pending.retain(|&x| x != i);
+        }
+        if pending.is_empty() {
+            break;
+        }
+    }
+    let greedy: f32 = pending.iter().map(|&i| natural[i]).sum();
+    for &i in &pending {
+        widths[i] = if greedy > 0.0 {
+            left * natural[i] / greedy
+        } else {
+            left / pending.len() as f32
+        };
+    }
+
+    // Honour the per-column floor where there is slack elsewhere to pay for it.
+    let deficit: f32 = widths
+        .iter()
+        .zip(floor)
+        .map(|(w, f)| (f - w).max(0.0))
+        .sum();
+    if deficit > 0.0 {
+        let slack: f32 = widths
+            .iter()
+            .zip(floor)
+            .map(|(w, f)| (w - f).max(0.0))
+            .sum();
+        if slack > 0.0 {
+            let taken = deficit.min(slack);
+            for (w, f) in widths.iter_mut().zip(floor) {
+                if *w > *f {
+                    *w -= taken * (*w - *f) / slack;
+                } else {
+                    *w += (*f - *w) * taken / deficit;
+                }
+            }
+        }
+    }
+    widths
+}
+
+/// Width of `text` once its inline markdown markers are dropped.
+fn text_width(ui: &egui::Ui, text: &str) -> f32 {
+    let plain = plain_text(text);
+    if plain.is_empty() {
+        return 0.0;
+    }
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    ui.fonts_mut(|f| {
+        f.layout_no_wrap(plain, font, egui::Color32::WHITE)
+            .size()
+            .x
+    })
+}
+
+/// Render one cell: `w` wide, aligned, with the markdown inside wrapped to fit.
+fn render_cell(
+    ui: &mut egui::Ui,
+    cache: &mut CommonMarkCache,
+    text: &str,
+    w: f32,
+    align: CellAlign,
+    header: bool,
+) {
+    let outer = match align {
+        CellAlign::Left => egui::Layout::top_down(egui::Align::LEFT),
+        CellAlign::Center => egui::Layout::top_down(egui::Align::Center),
+        CellAlign::Right => egui::Layout::top_down(egui::Align::RIGHT),
+    };
+    // Alignment only shows if the box around the content is narrower than the
+    // column, so size it to this cell rather than to the widest one.
+    let inner = match align {
+        CellAlign::Left => w,
+        // Slack, because the measurement misses monospace and bold runs.
+        _ => (text_width(ui, text) + 6.0).min(w),
+    };
+    ui.allocate_ui_with_layout(egui::vec2(w, 0.0), outer, |ui| {
+        ui.set_min_width(w);
+        ui.set_max_width(w);
+        let inner = inner.max(1.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(inner, 0.0),
+            egui::Layout::top_down(egui::Align::LEFT),
+            |ui| {
+                ui.set_max_width(inner);
+                if text.trim().is_empty() {
+                    ui.allocate_space(egui::vec2(inner, ui.text_style_height(&egui::TextStyle::Body)));
+                } else if header {
+                    ui.add(egui::Label::new(
+                        egui::RichText::new(plain_text(text)).strong(),
+                    ));
+                } else {
+                    CommonMarkViewer::new().show(ui, cache, text);
+                }
+            },
+        );
+    });
+}
+
+fn render_table(
+    ui: &mut egui::Ui,
+    cache: &mut CommonMarkCache,
+    headers: &[String],
+    aligns: &[CellAlign],
+    rows: &[Vec<String>],
+) {
+    const COL_GAP: f32 = 12.0;
+    let ncols = headers
+        .len()
+        .max(rows.iter().map(|r| r.len()).max().unwrap_or(0));
+    if ncols == 0 {
+        return;
+    }
+
+    let (natural, floor) = column_demands(ui, ncols, headers, rows);
+    let gaps = COL_GAP * (ncols - 1) as f32;
+    // Leave room for the group frame's own margins and stroke.
+    let avail = (ui.available_width() - gaps - 20.0).max(40.0 * ncols as f32);
+    let widths = fit_columns(&natural, &floor, avail);
+    let table_w: f32 = widths.iter().sum::<f32>() + gaps;
+
+    let align_of = |c: usize| aligns.get(c).copied().unwrap_or(CellAlign::Left);
+    let stripe = ui.visuals().faint_bg_color;
+
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.vertical(|ui| {
+            ui.set_min_width(table_w);
+            // Stripes span the whole box, not just the columns' own width.
+            let row_w = ui.available_width().max(table_w);
+
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = COL_GAP;
+                for (c, w) in widths.iter().enumerate() {
+                    let text = headers.get(c).map(String::as_str).unwrap_or("");
+                    render_cell(ui, cache, text, *w, align_of(c), true);
+                }
+            });
+            ui.separator();
+
+            for (r, row) in rows.iter().enumerate() {
+                let fill = if r % 2 == 1 {
+                    stripe
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                egui::Frame::new()
+                    .fill(fill)
+                    .inner_margin(egui::Margin::symmetric(2, 3))
+                    .show(ui, |ui| {
+                        ui.set_min_width(row_w);
+                        ui.horizontal_top(|ui| {
+                            ui.spacing_mut().item_spacing.x = COL_GAP;
+                            for (c, w) in widths.iter().enumerate() {
+                                let text = row.get(c).map(String::as_str).unwrap_or("");
+                                render_cell(ui, cache, text, *w, align_of(c), false);
+                            }
+                        });
+                    });
+            }
+        });
+    });
+}
+
 fn render_segments(ui: &mut egui::Ui, cache: &mut CommonMarkCache, segments: &[Segment]) {
     for segment in segments {
         match segment {
             Segment::Markdown(text) => {
                 CommonMarkViewer::new().show(ui, cache, text);
             }
-            Segment::Table { raw, headers, rows } => {
+            Segment::Table {
+                raw: _,
+                headers,
+                aligns,
+                rows,
+            } => {
                 ui.horizontal(|ui| {
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
@@ -306,7 +641,7 @@ fn render_segments(ui: &mut egui::Ui, cache: &mut CommonMarkCache, segments: &[S
                         },
                     );
                 });
-                CommonMarkViewer::new().show(ui, cache, raw);
+                render_table(ui, cache, headers, aligns, rows);
             }
         }
     }
